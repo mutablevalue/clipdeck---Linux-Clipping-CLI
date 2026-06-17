@@ -22,6 +22,9 @@ struct ClipDeckSettings {
   int video_bitrate_kbps = 12000;
   int audio_bitrate_kbps = 192;
   std::string encoder = "openh264";
+  bool feedback_sound_enabled = true;
+  std::filesystem::path feedback_sound_path;
+  double feedback_sound_volume = 0.5;
 };
 
 class SettingsStore {

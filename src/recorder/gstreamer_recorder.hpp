@@ -38,6 +38,8 @@ private:
   void MonitorBus(std::stop_token stop_token);
   void CleanSegmentDirectory() const;
   void SplitCurrentSegment() const;
+  [[nodiscard]] bool WaitForAnyFinalizedSegment(
+      std::chrono::milliseconds timeout) const;
   [[nodiscard]] std::vector<std::filesystem::path> SelectSegmentsForClip() const;
   [[nodiscard]] std::size_t SegmentBytes() const;
   [[nodiscard]] std::size_t SegmentCount() const;
@@ -52,6 +54,9 @@ private:
   std::atomic_bool running_{false};
   bool healthy_ = false;
   std::string message_ = "not started";
+  std::string last_capture_anomaly_;
+  std::string last_save_failure_;
+  std::filesystem::path last_saved_clip_;
   void *pipeline_ = nullptr;
   void *splitmux_sink_ = nullptr;
   void *bus_ = nullptr;

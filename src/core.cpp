@@ -5,6 +5,8 @@
 #include "recorder/recorder_backend.hpp"
 #include "recorder/recorder_setup.hpp"
 #include "recorder/segment_file.hpp"
+#include "feedback_notifier.hpp"
+#include "save_request_controller.hpp"
 #include "utils/logger.hpp"
 #include "utils/process.hpp"
 #include "utils/runtime_paths.hpp"
@@ -16,6 +18,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <utility>
@@ -35,6 +38,8 @@ void HandleSaveSignal(int) {
   save_requested = 1;
 }
 
+std::string BoolString(bool value) { return value ? "true" : "false"; }
+
 std::string RecorderStatusLine(const clipdeck::RecorderStatus &status) {
   return "backend=" + status.backend + "\n" +
          "running=" + (status.running ? std::string("true") : "false") + "\n" +
@@ -44,7 +49,66 @@ std::string RecorderStatusLine(const clipdeck::RecorderStatus &status) {
          std::to_string(status.buffered_duration.count()) + "\n" +
          "buffered_bytes=" + std::to_string(status.buffered_bytes) + "\n" +
          "memory_budget_bytes=" +
-         std::to_string(status.memory_budget_bytes) + "\n";
+         std::to_string(status.memory_budget_bytes) + "\n" +
+         "finalized_segment_count=" +
+         std::to_string(status.finalized_segment_count) + "\n" +
+         "finalized_segment_duration_ms=" +
+         std::to_string(status.finalized_segment_duration.count()) + "\n" +
+         "can_save_any_clip=" + BoolString(status.can_save_any_clip) + "\n" +
+         "can_save_full_clip_without_padding=" +
+         BoolString(status.can_save_full_clip_without_padding) + "\n" +
+         "last_capture_anomaly=" + status.last_capture_anomaly + "\n" +
+         "last_save_failure=" + status.last_save_failure + "\n" +
+         "last_saved_clip=" + status.last_saved_clip.string() + "\n" +
+         "audio_sample_rate=" +
+         (status.audio_sample_rate.has_value()
+              ? std::to_string(status.audio_sample_rate.value())
+              : std::string("unknown")) +
+         "\n" +
+         "audio_channels=" +
+         (status.audio_channels.has_value()
+              ? std::to_string(status.audio_channels.value())
+              : std::string("unknown")) +
+         "\n" +
+         "audio_enabled=" + BoolString(status.audio_enabled) + "\n";
+}
+
+std::string TimePointLine(
+    const std::optional<std::chrono::system_clock::time_point> &time_point) {
+  if (!time_point.has_value()) {
+    return "never";
+  }
+
+  return std::to_string(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          time_point.value().time_since_epoch())
+          .count());
+}
+
+std::string ListenerStatusLine(
+    const clipdeck::ListenerStatus &listener_status,
+    const clipdeck::SaveControllerStatus &save_status) {
+  const std::string last_source =
+      save_status.last_request_source.has_value()
+          ? std::string(clipdeck::SaveSourceName(
+                save_status.last_request_source.value()))
+          : std::string("none");
+
+  return "running=" + BoolString(listener_status.running) + "\n" +
+         "save_keybind=" + listener_status.save_keybind + "\n" +
+         "input_directory=" + listener_status.input_directory.string() + "\n" +
+         "scanned_devices=" +
+         std::to_string(listener_status.scanned_devices) + "\n" +
+         "readable_devices=" +
+         std::to_string(listener_status.readable_devices) + "\n" +
+         "accepted_keyboard_devices=" +
+         std::to_string(listener_status.accepted_keyboard_devices) + "\n" +
+         "last_error=" + listener_status.last_error + "\n" +
+         "last_keybind_detected_ms=" +
+         TimePointLine(listener_status.last_keybind_detected) + "\n" +
+         "last_save_request_source=" + last_source + "\n" +
+         "save_currently_running=" + BoolString(save_status.saving) + "\n" +
+         "pending_save=" + BoolString(save_status.pending) + "\n";
 }
 
 void WriteRecorderStatusFile(const clipdeck::RecorderStatus &status) {
@@ -59,6 +123,23 @@ void WriteRecorderStatusFile(const clipdeck::RecorderStatus &status) {
   std::ofstream output(clipdeck::RecorderStatusPath(), std::ios::trunc);
   if (output.is_open()) {
     output << RecorderStatusLine(status);
+  }
+}
+
+void WriteListenerStatusFile(
+    const clipdeck::ListenerStatus &listener_status,
+    const clipdeck::SaveControllerStatus &save_status) {
+  std::error_code error;
+  std::filesystem::create_directories(
+      clipdeck::ListenerStatusPath().parent_path(), error);
+
+  if (error) {
+    return;
+  }
+
+  std::ofstream output(clipdeck::ListenerStatusPath(), std::ios::trunc);
+  if (output.is_open()) {
+    output << ListenerStatusLine(listener_status, save_status);
   }
 }
 
@@ -79,9 +160,27 @@ void PrintRecorderStatusFile() {
   }
 }
 
+void PrintListenerStatusFile() {
+  std::ifstream input(clipdeck::ListenerStatusPath());
+
+  if (!input.is_open()) {
+    Log(LogLevel::Warning, kCoreContext,
+        "Global listener runtime status is not available yet.");
+    return;
+  }
+
+  std::string line;
+  while (std::getline(input, line)) {
+    if (!line.empty()) {
+      Log(LogLevel::Info, kCoreContext, "Global listener " + line + ".");
+    }
+  }
+}
+
 void PrintRetainedSegmentStatus(int clip_length_seconds) {
-  const auto segments = clipdeck::SelectRecentSegmentsForDuration(
-      clipdeck::SegmentDirectory(), std::chrono::seconds(clip_length_seconds));
+  const auto segments = clipdeck::SelectRecentFinalizedSegmentsByCount(
+      clipdeck::SegmentDirectory(),
+      static_cast<std::size_t>(std::max(clip_length_seconds + 2, 1)));
   if (segments.empty()) {
     return;
   }
@@ -133,7 +232,70 @@ std::optional<std::filesystem::path> NewestClipModifiedAfter(
   return newest_clip;
 }
 
-std::optional<std::filesystem::path> WaitForPublishedClip(
+std::unordered_map<std::string, std::string>
+ReadKeyValueFile(const std::filesystem::path &path) {
+  std::unordered_map<std::string, std::string> values;
+  std::ifstream input(path);
+  if (!input.is_open()) {
+    return values;
+  }
+
+  std::string line;
+  while (std::getline(input, line)) {
+    const std::size_t separator = line.find('=');
+    if (separator == std::string::npos) {
+      continue;
+    }
+
+    values.emplace(line.substr(0, separator), line.substr(separator + 1));
+  }
+
+  return values;
+}
+
+std::optional<std::string> CurrentRecorderUnhealthyReason() {
+  const auto status = ReadKeyValueFile(clipdeck::RecorderStatusPath());
+  if (status.empty()) {
+    return std::nullopt;
+  }
+
+  if (const auto healthy = status.find("healthy");
+      healthy != status.end() && healthy->second == "false") {
+    if (const auto message = status.find("message");
+        message != status.end() && !message->second.empty()) {
+      return message->second;
+    }
+
+    return std::string("Recorder is not healthy.");
+  }
+
+  return std::nullopt;
+}
+
+std::optional<std::string> CurrentSaveFailure() {
+  const auto status = ReadKeyValueFile(clipdeck::RecorderStatusPath());
+  if (status.empty()) {
+    return std::nullopt;
+  }
+
+  if (auto unhealthy = CurrentRecorderUnhealthyReason(); unhealthy.has_value()) {
+    return unhealthy;
+  }
+
+  if (const auto failure = status.find("last_save_failure");
+      failure != status.end() && !failure->second.empty()) {
+    return failure->second;
+  }
+
+  return std::nullopt;
+}
+
+struct SaveWaitResult {
+  std::optional<std::filesystem::path> clip;
+  std::optional<std::string> failure;
+};
+
+SaveWaitResult WaitForPublishedClipOrFailure(
     const std::filesystem::path &clip_directory,
     std::filesystem::file_time_type threshold,
     std::chrono::seconds timeout) {
@@ -142,13 +304,22 @@ std::optional<std::filesystem::path> WaitForPublishedClip(
   while (std::chrono::steady_clock::now() < deadline) {
     if (auto clip = NewestClipModifiedAfter(clip_directory, threshold);
         clip.has_value()) {
-      return clip;
+      return SaveWaitResult{.clip = clip, .failure = std::nullopt};
+    }
+
+    std::error_code error;
+    const auto status_modified_time =
+        std::filesystem::last_write_time(clipdeck::RecorderStatusPath(), error);
+    if (!error && status_modified_time >= threshold) {
+      if (auto failure = CurrentSaveFailure(); failure.has_value()) {
+        return SaveWaitResult{.clip = std::nullopt, .failure = failure};
+      }
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }
 
-  return std::nullopt;
+  return SaveWaitResult{.clip = std::nullopt, .failure = std::nullopt};
 }
 
 bool WaitForProcessExit(pid_t pid, std::chrono::milliseconds timeout) {
@@ -264,23 +435,62 @@ int ClipDeckCore::RunListener() {
   WriteRecorderStatusFile(RecorderStatus{.running = false,
                                          .healthy = false,
                                          .backend = "native",
-                                         .message = "starting"});
+                                         .message = "starting",
+                                         .buffered_duration =
+                                             std::chrono::milliseconds(0),
+                                         .buffered_bytes = 0,
+                                         .memory_budget_bytes = 0,
+                                         .finalized_segment_count = 0,
+                                         .finalized_segment_duration =
+                                             std::chrono::milliseconds(0),
+                                         .can_save_any_clip = false,
+                                         .can_save_full_clip_without_padding =
+                                             false,
+                                         .last_capture_anomaly = "",
+                                         .last_save_failure = "",
+                                         .last_saved_clip = {},
+                                         .audio_sample_rate = std::nullopt,
+                                         .audio_channels = std::nullopt,
+                                         .audio_enabled =
+                                             settings_.capture_audio_enabled});
   if (!recorder->Start()) {
     Log(LogLevel::Warning, kCoreContext,
         "Native recorder did not start. Keybinds will still listen, but saves will fail until the recorder is healthy.");
   }
   WriteRecorderStatusFile(recorder->Status());
 
+  SaveRequestController save_controller(
+      [&](SaveSource source) {
+        Log(LogLevel::Info, kCoreContext,
+            "Processing clip save request from " +
+                std::string(SaveSourceName(source)) + ".");
+        const bool saved = recorder->SaveClip();
+        WriteRecorderStatusFile(recorder->Status());
+        Log(saved ? LogLevel::Info : LogLevel::Error, kCoreContext,
+            "Finished clip save request from " +
+                std::string(SaveSourceName(source)) +
+                (saved ? " successfully." : " with failure."));
+      },
+      SaveRequestControllerConfig{.keybind_debounce = std::chrono::seconds(1)});
+  FeedbackNotifier feedback_notifier(settings_);
+
   listener.SetKeybindCallback([&](std::string_view action) {
     if (action != "save") {
       return;
     }
 
-    recorder->SaveClip();
-    WriteRecorderStatusFile(recorder->Status());
+    if (save_controller.RequestSave(SaveSource::Keybind)) {
+      Log(LogLevel::Info, kCoreContext,
+          "Accepted keybind clip save request.");
+      feedback_notifier.NotifyKeybindAccepted();
+    } else {
+      Log(LogLevel::Debug, kCoreContext,
+          "Ignored keybind clip save request.");
+    }
   });
 
   listener.Start();
+  WriteListenerStatusFile(listener.Status(), save_controller.Status());
 
   auto next_status_write = std::chrono::steady_clock::now();
 
@@ -288,12 +498,18 @@ int ClipDeckCore::RunListener() {
     if (save_requested != 0) {
       save_requested = 0;
 
-      recorder->SaveClip();
-      WriteRecorderStatusFile(recorder->Status());
+      if (save_controller.RequestSave(SaveSource::Manual)) {
+        Log(LogLevel::Info, kCoreContext,
+            "Accepted manual clip save request.");
+      } else {
+        Log(LogLevel::Warning, kCoreContext,
+            "Ignored manual clip save request.");
+      }
     }
 
     if (std::chrono::steady_clock::now() >= next_status_write) {
       WriteRecorderStatusFile(recorder->Status());
+      WriteListenerStatusFile(listener.Status(), save_controller.Status());
       next_status_write = std::chrono::steady_clock::now() +
                           std::chrono::seconds(1);
     }
@@ -302,8 +518,10 @@ int ClipDeckCore::RunListener() {
   }
 
   listener.Stop();
+  save_controller.Stop();
   recorder->Stop();
   WriteRecorderStatusFile(recorder->Status());
+  WriteListenerStatusFile(listener.Status(), save_controller.Status());
 
   Log(LogLevel::Info, kCoreContext, "ClipDeck listener runtime stopped.");
   return 0;
@@ -341,6 +559,7 @@ void ClipDeckCore::Stop() {
   RemovePidFile(pid_file);
   std::error_code error;
   std::filesystem::remove(RecorderStatusPath(), error);
+  std::filesystem::remove(ListenerStatusPath(), error);
 
   if (!stopped_any) {
     Log(LogLevel::Info, kCoreContext, "ClipDeck listener is not running.");
@@ -352,8 +571,19 @@ bool ClipDeckCore::Save() {
 
   const auto pid = ReadPidFile(PidFilePath());
   if (!pid.has_value() || !IsProcessRunning(pid.value())) {
-    const auto segments = SelectRecentSegmentsForDuration(
-        SegmentDirectory(), std::chrono::seconds(settings_.clip_length_seconds));
+    if (pid.has_value()) {
+      RemovePidFile(PidFilePath());
+      std::error_code status_error;
+      std::filesystem::remove(RecorderStatusPath(), status_error);
+      std::filesystem::remove(ListenerStatusPath(), status_error);
+    }
+
+    const auto segments = SelectRecentFinalizedSegmentsByCount(
+        SegmentDirectory(),
+        static_cast<std::size_t>(
+            std::max(settings_.clip_length_seconds +
+                         std::clamp(settings_.buffer_safety_seconds, 1, 3),
+                     1)));
     if (segments.empty()) {
       Log(LogLevel::Error, kCoreContext,
           "ClipDeck daemon is not running and no retained recorder segments are available.");
@@ -374,7 +604,11 @@ bool ClipDeckCore::Save() {
                                    .audio_bitrate_kbps =
                                        recorder_config.audio_bitrate_kbps,
                                    .audio_enabled =
-                                       recorder_config.audio_enabled});
+                                       recorder_config.audio_enabled,
+                                   .trust_recorder_segments = true,
+                                   .available_duration_seconds =
+                                       static_cast<double>(segments.size()),
+                                   .validate_black_frames = false});
     if (!clip_path.has_value()) {
       Log(LogLevel::Error, kCoreContext,
           "Failed to save a clip from retained recorder segments.");
@@ -389,6 +623,13 @@ bool ClipDeckCore::Save() {
 
   const auto save_requested_at =
       std::filesystem::file_time_type::clock::now() - std::chrono::seconds(1);
+
+  if (auto failure = CurrentRecorderUnhealthyReason(); failure.has_value()) {
+    Log(LogLevel::Error, kCoreContext,
+        "Daemon recorder is not ready to save: " + failure.value());
+    return false;
+  }
+
   if (kill(pid.value(), SIGUSR1) != 0) {
     Log(LogLevel::Error, kCoreContext,
         "Failed to request native clip save from daemon pid " +
@@ -402,12 +643,18 @@ bool ClipDeckCore::Save() {
 
   const auto timeout =
       std::chrono::seconds(std::max(30, settings_.clip_length_seconds * 3));
-  const auto clip =
-      WaitForPublishedClip(settings_.clip_directory, save_requested_at, timeout);
-  if (clip.has_value()) {
+  const auto result = WaitForPublishedClipOrFailure(
+      settings_.clip_directory, save_requested_at, timeout);
+  if (result.clip.has_value()) {
     Log(LogLevel::Info, kCoreContext,
-        "Saved clip: " + clip.value().string() + ".");
+        "Saved clip: " + result.clip.value().string() + ".");
     return true;
+  }
+
+  if (result.failure.has_value()) {
+    Log(LogLevel::Error, kCoreContext,
+        "Daemon failed to save clip: " + result.failure.value());
+    return false;
   }
 
   Log(LogLevel::Error, kCoreContext,
@@ -422,6 +669,9 @@ void ClipDeckCore::Status() {
 
   if (pid.has_value() && !running) {
     RemovePidFile(PidFilePath());
+    std::error_code status_error;
+    std::filesystem::remove(RecorderStatusPath(), status_error);
+    std::filesystem::remove(ListenerStatusPath(), status_error);
     Log(LogLevel::Warning, kCoreContext,
         "Removed stale ClipDeck pid file for pid " + std::to_string(pid.value()) +
             ".");
@@ -434,6 +684,7 @@ void ClipDeckCore::Status() {
 
   if (running) {
     PrintRecorderStatusFile();
+    PrintListenerStatusFile();
   } else {
     auto recorder =
         GStreamerRecorder(BuildRecorderConfig(settings_));

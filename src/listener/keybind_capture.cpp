@@ -29,7 +29,7 @@ CaptureKeybindFromTerminal(std::chrono::seconds timeout) {
 
   if (!terminal_mode.IsEnabled()) {
     Log(LogLevel::Warning, kCaptureContext,
-        "Terminal raw mode is unavailable; keybind capture may be limited.");
+        "Terminal raw mode is unavailable; setup keybind capture may be limited.");
   }
 
   while (std::chrono::steady_clock::now() < expires_at) {

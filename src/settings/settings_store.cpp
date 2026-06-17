@@ -165,6 +165,31 @@ ClipDeckSettings SettingsStore::Load() const {
       continue;
     }
 
+    if (key == "feedback_sound_enabled") {
+      bool enabled = true;
+      if (ParseBoolean(value, enabled)) {
+        settings.feedback_sound_enabled = enabled;
+      }
+      continue;
+    }
+
+    if (key == "feedback_sound_path") {
+      settings.feedback_sound_path =
+          value.empty() ? std::filesystem::path{} : ResolveStoredPath(value);
+      continue;
+    }
+
+    if (key == "feedback_sound_volume") {
+      try {
+        const double volume = std::stod(value);
+        if (volume >= 0.0 && volume <= 1.0) {
+          settings.feedback_sound_volume = volume;
+        }
+      } catch (...) {
+      }
+      continue;
+    }
+
   }
 
   return settings;
@@ -203,6 +228,11 @@ bool SettingsStore::Save(const ClipDeckSettings &settings) const {
   output << "video_bitrate_kbps=" << settings.video_bitrate_kbps << '\n';
   output << "audio_bitrate_kbps=" << settings.audio_bitrate_kbps << '\n';
   output << "encoder=" << settings.encoder << '\n';
+  output << "feedback_sound_enabled="
+         << (settings.feedback_sound_enabled ? "true" : "false") << '\n';
+  output << "feedback_sound_path=" << settings.feedback_sound_path.string()
+         << '\n';
+  output << "feedback_sound_volume=" << settings.feedback_sound_volume << '\n';
 
   return output.good();
 }

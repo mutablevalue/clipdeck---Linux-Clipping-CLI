@@ -36,6 +36,8 @@ endif()
 set(CLIPDECK_CORE_SOURCES
     src/commands/commands.cpp
     src/core.cpp
+    src/feedback_notifier.cpp
+    src/save_request_controller.cpp
     src/listener/daemon_listener.cpp
     src/listener/keybind.cpp
     src/listener/keybind_capture.cpp
@@ -43,6 +45,7 @@ set(CLIPDECK_CORE_SOURCES
     src/recorder/clip_muxer.cpp
     src/recorder/encoded_ring_buffer.cpp
     src/recorder/gstreamer_recorder.cpp
+    src/recorder/media_probe.cpp
     src/recorder/recorder_backend.cpp
     src/recorder/recorder_setup.cpp
     src/recorder/segment_file.cpp
@@ -117,6 +120,8 @@ if(BUILD_TESTING)
 
     add_executable(clipdeck_tests
         src/tests/clip_muxer_test.cpp
+        src/tests/daemon_listener_test.cpp
+        src/tests/feedback_notifier_test.cpp
         src/tests/gstreamer_recorder_test.cpp
         src/tests/keybind_test.cpp
         src/tests/encoded_ring_buffer_test.cpp
@@ -124,6 +129,7 @@ if(BUILD_TESTING)
         src/tests/recorder_backend_test.cpp
         src/tests/recorder_setup_test.cpp
         src/tests/runtime_paths_test.cpp
+        src/tests/save_request_controller_test.cpp
         src/tests/settings_store_test.cpp
         src/tests/string_utils_test.cpp
     )

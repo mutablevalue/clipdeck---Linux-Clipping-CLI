@@ -417,9 +417,11 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
 
 int CommandHandler::SetKeybindFromCapture() const {
   Log(LogLevel::Info, kCommandContext,
-      "Press the save keybind as X + Y + Z, for example Ctrl + Z + P.");
+      "Press the save keybind for terminal-only setup capture, for example Ctrl + Z + P.");
   Log(LogLevel::Info, kCommandContext,
       "For terminal capture, hold Ctrl and press Z, then press P, then press Enter.");
+  Log(LogLevel::Info, kCommandContext,
+      "This setup capture does not verify global /dev/input event permissions for the daemon.");
 
   const auto captured_keybind =
       CaptureKeybindFromTerminal(std::chrono::seconds(15));

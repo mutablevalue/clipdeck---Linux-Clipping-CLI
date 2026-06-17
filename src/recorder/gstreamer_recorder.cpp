@@ -28,6 +28,13 @@ namespace {
 constexpr std::string_view kRecorderContext = "native-recorder";
 constexpr int kSegmentSeconds = 1;
 
+struct RecorderSegmentSummary {
+  std::size_t count = 0;
+  std::chrono::milliseconds duration{0};
+  std::optional<int> audio_sample_rate;
+  std::optional<int> audio_channels;
+};
+
 std::size_t RetainedSegmentCount(const clipdeck::RecorderConfig &config) {
   return static_cast<std::size_t>(config.clip_length_seconds +
                                   config.buffer_safety_seconds + 3);
@@ -45,7 +52,81 @@ std::string GstQuote(std::string_view value) {
   return quoted;
 }
 
+RecorderSegmentSummary SegmentSummary(std::size_t count, bool audio_expected) {
+  RecorderSegmentSummary summary{
+      .count = count,
+      .duration = std::chrono::seconds(count * kSegmentSeconds),
+      .audio_sample_rate = std::nullopt,
+      .audio_channels = std::nullopt};
+  if (audio_expected && count > 0) {
+    summary.audio_sample_rate = 48000;
+    summary.audio_channels = 2;
+  }
+
+  return summary;
+}
+
+std::size_t RawVideoFrameBytes(const clipdeck::RecorderConfig &config) {
+  return static_cast<std::size_t>(std::max(config.width, 1)) *
+         static_cast<std::size_t>(std::max(config.height, 1)) * 3 / 2;
+}
+
+int RawVideoQueueFrameLimit(const clipdeck::RecorderConfig &config) {
+  return std::clamp(std::max(config.fps / 4, 4), 4, 30);
+}
+
+std::size_t EncodedQueueByteLimit(int bitrate_kbps,
+                                  std::chrono::seconds duration,
+                                  std::size_t minimum_bytes) {
+  const auto bitrate_bytes =
+      (static_cast<std::size_t>(std::max(bitrate_kbps, 1)) * 1000 *
+       static_cast<std::size_t>(duration.count())) /
+      8;
+  return std::max(bitrate_bytes, minimum_bytes);
+}
+
+std::string LiveRawVideoQueue(const clipdeck::RecorderConfig &config) {
+  const int frame_limit = RawVideoQueueFrameLimit(config);
+  const std::size_t byte_limit =
+      RawVideoFrameBytes(config) * static_cast<std::size_t>(frame_limit);
+  return std::format("queue max-size-buffers={} max-size-bytes={} "
+                     "max-size-time=250000000 leaky=downstream",
+                     frame_limit, byte_limit);
+}
+
+std::string LiveEncodedVideoQueue(const clipdeck::RecorderConfig &config) {
+  return std::format("queue max-size-buffers=0 max-size-bytes={} "
+                     "max-size-time=2000000000",
+                     EncodedQueueByteLimit(config.video_bitrate_kbps,
+                                           std::chrono::seconds(2),
+                                           4 * 1024 * 1024));
+}
+
+std::string LiveRawAudioQueue() {
+  return "queue max-size-buffers=0 max-size-bytes=1048576 "
+         "max-size-time=500000000 leaky=downstream";
+}
+
+std::string LiveEncodedAudioQueue(const clipdeck::RecorderConfig &config) {
+  return std::format("queue max-size-buffers=0 max-size-bytes={} "
+                     "max-size-time=2000000000",
+                     EncodedQueueByteLimit(config.audio_bitrate_kbps,
+                                           std::chrono::seconds(2),
+                                           512 * 1024));
+}
+
 #if defined(CLIPDECK_HAS_GSTREAMER)
+bool GstElementAvailable(std::string_view factory_name) {
+  GstElementFactory *factory =
+      gst_element_factory_find(std::string(factory_name).c_str());
+  if (factory == nullptr) {
+    return false;
+  }
+
+  gst_object_unref(factory);
+  return true;
+}
+
 std::string StateChangeReturnName(GstStateChangeReturn state) {
   switch (state) {
   case GST_STATE_CHANGE_FAILURE:
@@ -557,6 +638,8 @@ bool GStreamerRecorder::Start() {
 
   GError *error = nullptr;
   const std::string pipeline_description = BuildPipelineDescription();
+  Log(LogLevel::Debug, kRecorderContext,
+      "GStreamer pipeline description: " + pipeline_description);
   GstElement *pipeline = gst_parse_launch(pipeline_description.c_str(), &error);
 
   if (pipeline == nullptr) {
@@ -719,6 +802,11 @@ void GStreamerRecorder::Stop() {
 bool GStreamerRecorder::SaveClip() {
   std::scoped_lock save_lock(save_mutex_);
 
+  {
+    std::scoped_lock lock(state_mutex_);
+    last_save_failure_.clear();
+  }
+
   std::string unhealthy_message;
   {
     std::scoped_lock lock(state_mutex_);
@@ -730,13 +818,39 @@ bool GStreamerRecorder::SaveClip() {
   if (!unhealthy_message.empty()) {
     Log(LogLevel::Error, kRecorderContext,
         "Native recorder is not healthy: " + unhealthy_message);
+    {
+      std::scoped_lock lock(state_mutex_);
+      last_save_failure_ = "Native recorder is not healthy: " + unhealthy_message;
+    }
     return false;
   }
 
   SplitCurrentSegment();
-  std::this_thread::sleep_for(std::chrono::milliseconds(750));
+  if (!WaitForAnyFinalizedSegment(std::chrono::seconds(2))) {
+    Log(LogLevel::Warning, kRecorderContext,
+        "Recorder has not produced a finalized segment yet.");
+    {
+      std::scoped_lock lock(state_mutex_);
+      last_save_failure_ =
+          "Recorder has not produced a finalized segment yet.";
+    }
+    return false;
+  }
 
   const auto segments = SelectSegmentsForClip();
+  if (segments.empty()) {
+    Log(LogLevel::Warning, kRecorderContext,
+        "Recorder has no usable finalized segments for saving.");
+    {
+      std::scoped_lock lock(state_mutex_);
+      last_save_failure_ =
+          "Recorder has no usable finalized segments for saving.";
+    }
+    return false;
+  }
+
+  const double selected_duration_seconds =
+      static_cast<double>(segments.size() * kSegmentSeconds);
   const auto clip_path = muxer_.WriteClipFromSegments(
       segments, ClipMuxerOptions{.target_duration =
                                      std::chrono::seconds(
@@ -748,30 +862,80 @@ bool GStreamerRecorder::SaveClip() {
                                      config_.video_bitrate_kbps,
                                  .audio_bitrate_kbps =
                                      config_.audio_bitrate_kbps,
-                                 .audio_enabled = config_.audio_enabled});
+                                 .audio_enabled = config_.audio_enabled,
+                                 .trust_recorder_segments = true,
+                                 .available_duration_seconds =
+                                     selected_duration_seconds,
+                                 .validate_black_frames = false});
 
   if (!clip_path.has_value()) {
-    Log(LogLevel::Error, kRecorderContext, "Native clip save failed.");
+    const std::string muxer_failure = muxer_.LastFailure();
+    const std::string save_failure =
+        muxer_failure.empty() ? "Native clip save failed." : muxer_failure;
+    Log(LogLevel::Error, kRecorderContext,
+        "Native clip save failed: " + save_failure);
+    {
+      std::scoped_lock lock(state_mutex_);
+      last_save_failure_ = save_failure;
+      if (!muxer_failure.empty()) {
+        last_capture_anomaly_ = muxer_failure;
+      }
+    }
     return false;
   }
 
   Log(LogLevel::Info, kRecorderContext,
       "Stored clip: " + clip_path.value().string() + ".");
+  {
+    std::scoped_lock lock(state_mutex_);
+    last_capture_anomaly_.clear();
+    last_save_failure_.clear();
+    last_saved_clip_ = clip_path.value();
+  }
   return true;
 }
 
 RecorderStatus GStreamerRecorder::Status() const {
-  std::scoped_lock lock(state_mutex_);
+  bool running = false;
+  bool healthy = false;
+  std::string message;
+  std::string last_capture_anomaly;
+  std::string last_save_failure;
+  std::filesystem::path last_saved_clip;
+  {
+    std::scoped_lock lock(state_mutex_);
+    running = running_;
+    healthy = healthy_;
+    message = message_;
+    last_capture_anomaly = last_capture_anomaly_;
+    last_save_failure = last_save_failure_;
+    last_saved_clip = last_saved_clip_;
+  }
+
   const auto count = SegmentCount();
-  return RecorderStatus{.running = running_,
-                        .healthy = healthy_,
+  const auto segment_summary =
+      SegmentSummary(count, config_.audio_enabled);
+  return RecorderStatus{.running = running,
+                        .healthy = healthy,
                         .backend = "native",
-                        .message = message_,
+                        .message = message,
                         .buffered_duration =
                             std::chrono::seconds(count * kSegmentSeconds),
                         .buffered_bytes = SegmentBytes(),
                         .memory_budget_bytes = EstimateRecorderMemoryBudgetBytes(
-                            config_)};
+                            config_),
+                        .finalized_segment_count = segment_summary.count,
+                        .finalized_segment_duration = segment_summary.duration,
+                        .can_save_any_clip = segment_summary.count > 0,
+                        .can_save_full_clip_without_padding =
+                            segment_summary.duration >=
+                            std::chrono::seconds(config_.clip_length_seconds),
+                        .last_capture_anomaly = last_capture_anomaly,
+                        .last_save_failure = last_save_failure,
+                        .last_saved_clip = last_saved_clip,
+                        .audio_sample_rate = segment_summary.audio_sample_rate,
+                        .audio_channels = segment_summary.audio_channels,
+                        .audio_enabled = config_.audio_enabled};
 }
 
 #if defined(CLIPDECK_ENABLE_RECORDER_TEST_HOOKS)
@@ -879,9 +1043,27 @@ void GStreamerRecorder::SplitCurrentSegment() const {
 #endif
 }
 
+bool GStreamerRecorder::WaitForAnyFinalizedSegment(
+    std::chrono::milliseconds timeout) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!SelectSegmentsForClip().empty()) {
+      return true;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(75));
+  }
+
+  return !SelectSegmentsForClip().empty();
+}
+
 std::vector<std::filesystem::path> GStreamerRecorder::SelectSegmentsForClip() const {
-  return SelectRecentSegmentsForDuration(
-      segment_directory_, std::chrono::seconds(config_.clip_length_seconds));
+  const auto selected_count = static_cast<std::size_t>(
+      std::max(config_.clip_length_seconds +
+                   std::clamp(config_.buffer_safety_seconds, 1, 3),
+               1));
+  return SelectRecentFinalizedSegmentsByCount(segment_directory_,
+                                             selected_count);
 }
 
 std::size_t GStreamerRecorder::SegmentBytes() const {
@@ -929,6 +1111,9 @@ std::size_t GStreamerRecorder::SegmentCount() const {
 }
 
 std::string GStreamerRecorder::BuildPipelineDescription() const {
+#if defined(CLIPDECK_HAS_GSTREAMER)
+  EnsureGStreamerInitialized();
+#endif
   std::string video_source =
       "pipewiresrc name=clipdeck_screen_source client-name=ClipDeck fd=" +
       std::to_string(portal_fd_);
@@ -968,21 +1153,39 @@ std::string GStreamerRecorder::BuildPipelineDescription() const {
            << "max-files=" << RetainedSegmentCount(config_) << " "
            << "async-finalize=true muxer-factory=mp4mux "
            << video_source
-           << " ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! "
+           << " ! " << LiveRawVideoQueue(config_) << " ! "
            << video_convert << " "
-           << "! queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! "
+           << "! " << LiveRawVideoQueue(config_) << " ! "
            << video_encoder
-           << " ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 "
-           << "! clipdeck_splitmux.video ";
+           << " ! " << LiveEncodedVideoQueue(config_)
+           << " ! clipdeck_splitmux.video ";
 
   if (config_.audio_enabled && !config_.audio_source.empty()) {
+    const bool use_fdk_aac =
+#if defined(CLIPDECK_HAS_GSTREAMER)
+        GstElementAvailable("fdkaacenc");
+#else
+        false;
+#endif
+    const std::string audio_caps =
+        use_fdk_aac ? "audio/x-raw,format=S16LE,rate=48000,channels=2"
+                    : "audio/x-raw,format=F32LE,rate=48000,channels=2";
+    const std::string audio_encoder =
+        use_fdk_aac
+            ? std::format("fdkaacenc bitrate={} ! aacparse",
+                          config_.audio_bitrate_kbps * 1000)
+            : std::format("avenc_aac bitrate={} ! aacparse",
+                          config_.audio_bitrate_kbps * 1000);
+
     pipeline << "pulsesrc name=clipdeck_output_audio_source device="
              << GstQuote(config_.audio_source)
              << " do-timestamp=true "
-             << "! audioconvert ! audioresample ! avenc_aac bitrate="
-             << (config_.audio_bitrate_kbps * 1000)
-             << " ! aacparse ! queue max-size-buffers=0 max-size-bytes=0 "
-                "max-size-time=0 ! clipdeck_splitmux.audio_0 ";
+             << "! " << LiveRawAudioQueue() << " "
+             << "! audioconvert ! audioresample "
+             << "! " << audio_caps << " "
+             << "! " << audio_encoder
+             << " ! " << LiveEncodedAudioQueue(config_)
+             << " ! clipdeck_splitmux.audio_0 ";
   }
 
   return pipeline.str();

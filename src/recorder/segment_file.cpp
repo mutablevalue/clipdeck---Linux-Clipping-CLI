@@ -1,6 +1,7 @@
 #include "segment_file.hpp"
 
 #include "../utils/logger.hpp"
+#include "media_probe.hpp"
 
 #include <algorithm>
 #include <array>
@@ -144,9 +145,25 @@ bool IsFinalizedMp4Segment(const std::filesystem::path &path) {
     return false;
   }
 
-  std::string bytes((std::istreambuf_iterator<char>(input)),
-                    std::istreambuf_iterator<char>());
-  return bytes.find("moov") != std::string::npos;
+  std::array<char, 4096> buffer{};
+  std::string carry;
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const auto bytes_read = input.gcount();
+    if (bytes_read <= 0) {
+      break;
+    }
+
+    std::string chunk = carry;
+    chunk.append(buffer.data(), static_cast<std::size_t>(bytes_read));
+    if (chunk.find("moov") != std::string::npos) {
+      return true;
+    }
+
+    carry = chunk.size() > 3 ? chunk.substr(chunk.size() - 3) : chunk;
+  }
+
+  return false;
 }
 
 std::optional<double> Mp4DurationSeconds(const std::filesystem::path &path) {
@@ -168,6 +185,13 @@ std::optional<double> Mp4DurationSeconds(const std::filesystem::path &path) {
 std::vector<std::filesystem::path> SelectRecentSegmentsForDuration(
     const std::filesystem::path &segment_directory,
     std::chrono::seconds target_duration) {
+  return SelectRecentSegmentsForDuration(segment_directory, target_duration,
+                                         false);
+}
+
+std::vector<std::filesystem::path> SelectRecentSegmentsForDuration(
+    const std::filesystem::path &segment_directory,
+    std::chrono::seconds target_duration, bool audio_expected) {
   const auto segments = FinalizedSegmentEntries(segment_directory);
   std::vector<std::filesystem::path> selected;
   double selected_duration = 0.0;
@@ -175,16 +199,20 @@ std::vector<std::filesystem::path> SelectRecentSegmentsForDuration(
       static_cast<double>(std::max(target_duration.count(), 1L));
 
   for (const auto &segment : segments | std::views::reverse) {
-    const auto duration = Mp4DurationSeconds(segment.path);
-    if (!duration.has_value()) {
+    const auto probe = ProbeMediaFile(segment.path);
+    if (!probe.has_value() ||
+        !IsUsableRecorderSegment(probe.value(), audio_expected)) {
       Log(LogLevel::Debug, kSegmentContext,
-          "Skipping segment without readable duration: " +
+          "Skipping unusable recorder segment: " +
               segment.path.string());
+      if (!selected.empty()) {
+        break;
+      }
       continue;
     }
 
     selected.push_back(segment.path);
-    selected_duration += duration.value();
+    selected_duration += probe->duration_seconds;
 
     if (selected_duration >= target_seconds) {
       break;
@@ -195,9 +223,48 @@ std::vector<std::filesystem::path> SelectRecentSegmentsForDuration(
   return selected;
 }
 
+std::vector<std::filesystem::path> SelectRecentFinalizedSegmentsByCount(
+    const std::filesystem::path &segment_directory, std::size_t max_count) {
+  if (max_count == 0) {
+    return {};
+  }
+
+  auto segments = FinalizedSegmentEntries(segment_directory);
+  if (segments.size() > max_count) {
+    segments.erase(segments.begin(),
+                   segments.end() -
+                       static_cast<std::ptrdiff_t>(max_count));
+  }
+
+  std::vector<std::filesystem::path> selected;
+  selected.reserve(segments.size());
+  for (const auto &segment : segments) {
+    selected.push_back(segment.path);
+  }
+
+  return selected;
+}
+
 std::size_t
 FinalizedSegmentCount(const std::filesystem::path &segment_directory) {
   return FinalizedSegmentEntries(segment_directory).size();
+}
+
+double FinalizedSegmentDurationSeconds(
+    const std::filesystem::path &segment_directory, bool audio_expected) {
+  double duration_seconds = 0.0;
+
+  for (const auto &segment : FinalizedSegmentEntries(segment_directory)) {
+    const auto probe = ProbeMediaFile(segment.path);
+    if (!probe.has_value() ||
+        !IsUsableRecorderSegment(probe.value(), audio_expected)) {
+      continue;
+    }
+
+    duration_seconds += probe->duration_seconds;
+  }
+
+  return duration_seconds;
 }
 
 } // namespace clipdeck

@@ -32,6 +32,9 @@ TEST(SettingsStoreTest, LoadsDefaultsWhenFileDoesNotExist) {
   EXPECT_EQ(settings.video_bitrate_kbps, 12000);
   EXPECT_EQ(settings.audio_bitrate_kbps, 192);
   EXPECT_EQ(settings.encoder, "openh264");
+  EXPECT_TRUE(settings.feedback_sound_enabled);
+  EXPECT_TRUE(settings.feedback_sound_path.empty());
+  EXPECT_DOUBLE_EQ(settings.feedback_sound_volume, 0.5);
 }
 
 TEST(SettingsStoreTest, SavesAndLoadsSettings) {
@@ -52,6 +55,9 @@ TEST(SettingsStoreTest, SavesAndLoadsSettings) {
   saved_settings.video_bitrate_kbps = 8000;
   saved_settings.audio_bitrate_kbps = 160;
   saved_settings.encoder = "x264";
+  saved_settings.feedback_sound_enabled = false;
+  saved_settings.feedback_sound_path = "/tmp/clipdeck-sound.wav";
+  saved_settings.feedback_sound_volume = 0.25;
 
   const clipdeck::SettingsStore store(settings_path);
   ASSERT_TRUE(store.Save(saved_settings));
@@ -71,4 +77,7 @@ TEST(SettingsStoreTest, SavesAndLoadsSettings) {
   EXPECT_EQ(loaded_settings.video_bitrate_kbps, 8000);
   EXPECT_EQ(loaded_settings.audio_bitrate_kbps, 160);
   EXPECT_EQ(loaded_settings.encoder, "x264");
+  EXPECT_FALSE(loaded_settings.feedback_sound_enabled);
+  EXPECT_EQ(loaded_settings.feedback_sound_path, "/tmp/clipdeck-sound.wav");
+  EXPECT_DOUBLE_EQ(loaded_settings.feedback_sound_volume, 0.25);
 }

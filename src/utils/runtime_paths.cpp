@@ -1,5 +1,7 @@
 #include "runtime_paths.hpp"
 
+#include "../settings/settings_store.hpp"
+
 #include <array>
 #include <cstdlib>
 #include <unistd.h>
@@ -50,6 +52,23 @@ std::filesystem::path DaemonLogPath() {
 
 std::filesystem::path RecorderStatusPath() {
   return RuntimeDirectory() / "recorder-status.conf";
+}
+
+std::filesystem::path ListenerStatusPath() {
+  return RuntimeDirectory() / "listener-status.conf";
+}
+
+std::filesystem::path DefaultFeedbackSoundPath() {
+  return RuntimeDirectory() / "assets" / "sounds" / "clip-accepted.wav";
+}
+
+std::filesystem::path ResolveFeedbackSoundPath(
+    const ClipDeckSettings &settings) {
+  if (settings.feedback_sound_path.empty()) {
+    return DefaultFeedbackSoundPath();
+  }
+
+  return settings.feedback_sound_path;
 }
 
 } // namespace clipdeck

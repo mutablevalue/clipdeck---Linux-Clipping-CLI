@@ -3,12 +3,15 @@
 #include "../utils/app_error.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/runtime_paths.hpp"
+#include "media_probe.hpp"
 #include "segment_file.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -17,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -55,7 +59,173 @@ std::string FormatSeconds(double seconds) {
   return output.str();
 }
 
-int RunCommand(std::vector<std::string> arguments) {
+bool TrustedFinalClipLooksUsable(
+    const clipdeck::MediaProbeResult &probe,
+    const clipdeck::ClipMuxerOptions &options,
+    double expected_duration_seconds) {
+  if (!probe.valid || !probe.has_video || probe.duration_seconds <= 0.0) {
+    return false;
+  }
+
+  const double tolerance =
+      expected_duration_seconds >= 5.0 ? 1.0 : 0.5;
+  if (probe.duration_seconds + tolerance < expected_duration_seconds ||
+      probe.duration_seconds - expected_duration_seconds > tolerance) {
+    return false;
+  }
+
+  if (!options.audio_enabled) {
+    return true;
+  }
+
+  return probe.has_audio && probe.audio_sample_rate.value_or(0) == 48000 &&
+         probe.audio_channels.value_or(0) == 2;
+}
+
+bool FinalClipPassesValidation(
+    const std::optional<clipdeck::MediaProbeResult> &probe,
+    const clipdeck::ClipMuxerOptions &options,
+    double expected_duration_seconds) {
+  if (!probe.has_value()) {
+    return false;
+  }
+
+  if (options.trust_recorder_segments) {
+    return TrustedFinalClipLooksUsable(probe.value(), options,
+                                       expected_duration_seconds);
+  }
+
+  return clipdeck::IsUsableFinalClip(probe.value(), options,
+                                     expected_duration_seconds);
+}
+
+std::string FinalClipValidationFailure(
+    const std::optional<clipdeck::MediaProbeResult> &probe,
+    const clipdeck::ClipMuxerOptions &options,
+    double expected_duration_seconds) {
+  if (!probe.has_value()) {
+    return "ffprobe did not return a result";
+  }
+
+  if (!probe->valid || !probe->has_video || probe->duration_seconds <= 0.0) {
+    return probe->error_message.empty()
+               ? "missing video stream or positive duration"
+               : probe->error_message;
+  }
+
+  if (std::abs(probe->duration_seconds - expected_duration_seconds) > 0.5) {
+    return "duration " + FormatSeconds(probe->duration_seconds) +
+           "s is outside tolerance for expected export duration " +
+           FormatSeconds(expected_duration_seconds) + "s";
+  }
+
+  if (options.audio_enabled && !probe->has_audio) {
+    return "audio was expected but no audio stream was found";
+  }
+
+  if (options.audio_enabled && probe->audio_sample_rate.value_or(0) != 48000) {
+    return "audio sample rate is " +
+           (probe->audio_sample_rate.has_value()
+                ? std::to_string(probe->audio_sample_rate.value())
+                : std::string("unknown")) +
+           ", expected 48000";
+  }
+
+  if (options.audio_enabled && probe->audio_channels.value_or(0) != 2) {
+    return "audio channel count is " +
+           (probe->audio_channels.has_value()
+                ? std::to_string(probe->audio_channels.value())
+                : std::string("unknown")) +
+           ", expected 2";
+  }
+
+  return "unknown validation failure";
+}
+
+class ScopedDirectoryCleanup {
+public:
+  explicit ScopedDirectoryCleanup(std::filesystem::path path)
+      : path_(std::move(path)) {}
+
+  ~ScopedDirectoryCleanup() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  ScopedDirectoryCleanup(const ScopedDirectoryCleanup &) = delete;
+  ScopedDirectoryCleanup &operator=(const ScopedDirectoryCleanup &) = delete;
+
+private:
+  std::filesystem::path path_;
+};
+
+int ExitCodeFromWaitStatus(int status) {
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+
+  if (WIFSIGNALED(status)) {
+    return 128 + WTERMSIG(status);
+  }
+
+  return -1;
+}
+
+void SignalProcessGroupOrProcess(pid_t pid, int signal) {
+  if (kill(-pid, signal) != 0) {
+    kill(pid, signal);
+  }
+}
+
+int WaitForProcessWithTimeout(pid_t pid, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  int status = 0;
+
+  while (std::chrono::steady_clock::now() < deadline) {
+    const pid_t result = waitpid(pid, &status, WNOHANG);
+    if (result == pid) {
+      return ExitCodeFromWaitStatus(status);
+    }
+
+    if (result < 0 && errno != EINTR) {
+      return -1;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  SignalProcessGroupOrProcess(pid, SIGTERM);
+  const auto terminate_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < terminate_deadline) {
+    const pid_t result = waitpid(pid, &status, WNOHANG);
+    if (result == pid) {
+      return 124;
+    }
+
+    if (result < 0 && errno != EINTR) {
+      return 124;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  SignalProcessGroupOrProcess(pid, SIGKILL);
+  waitpid(pid, &status, 0);
+  return 124;
+}
+
+std::chrono::milliseconds ComposeTimeout(double export_duration_seconds,
+                                         bool stream_copy) {
+  const int seconds =
+      stream_copy
+          ? std::max(20, static_cast<int>(std::ceil(export_duration_seconds * 2.0)))
+          : std::max(60, static_cast<int>(std::ceil(export_duration_seconds * 4.0)));
+  return std::chrono::seconds(seconds);
+}
+
+int RunCommand(std::vector<std::string> arguments,
+               std::chrono::milliseconds timeout) {
   if (arguments.empty()) {
     return -1;
   }
@@ -67,6 +237,7 @@ int RunCommand(std::vector<std::string> arguments) {
   }
 
   if (pid == 0) {
+    setpgid(0, 0);
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1);
     for (auto &argument : arguments) {
@@ -78,20 +249,8 @@ int RunCommand(std::vector<std::string> arguments) {
     std::_Exit(127);
   }
 
-  int status = 0;
-  if (waitpid(pid, &status, 0) != pid) {
-    return -1;
-  }
-
-  if (WIFEXITED(status)) {
-    return WEXITSTATUS(status);
-  }
-
-  if (WIFSIGNALED(status)) {
-    return 128 + WTERMSIG(status);
-  }
-
-  return -1;
+  setpgid(pid, pid);
+  return WaitForProcessWithTimeout(pid, timeout);
 }
 
 std::string RunCommandCapture(std::vector<std::string> arguments) {
@@ -150,7 +309,7 @@ std::string RunCommandCapture(std::vector<std::string> arguments) {
   return output;
 }
 
-bool FfmpegEncoderAvailable(std::string_view encoder) {
+bool FfmpegEncoderAvailableUncached(std::string_view encoder) {
   const auto output =
       RunCommandCapture({"ffmpeg", "-hide_banner", "-encoders"});
   return output.find(std::string(encoder)) != std::string::npos;
@@ -158,11 +317,16 @@ bool FfmpegEncoderAvailable(std::string_view encoder) {
 
 std::vector<std::string>
 VideoEncoderArguments(const clipdeck::ClipMuxerOptions &options) {
-  if (FfmpegEncoderAvailable("libx264")) {
+  static const bool libx264_available =
+      FfmpegEncoderAvailableUncached("libx264");
+  static const bool libopenh264_available =
+      FfmpegEncoderAvailableUncached("libopenh264");
+
+  if (libx264_available) {
     return {"-c:v", "libx264", "-preset", "veryfast", "-crf", "23"};
   }
 
-  if (FfmpegEncoderAvailable("libopenh264")) {
+  if (libopenh264_available) {
     return {"-c:v", "libopenh264", "-b:v",
             std::to_string(options.video_bitrate_kbps) + "k"};
   }
@@ -187,54 +351,14 @@ void AppendAudioEncoderArguments(std::vector<std::string> &arguments,
   arguments.emplace_back(std::to_string(options.audio_bitrate_kbps) + "k");
 }
 
-bool CreateBlackPaddingSegment(const std::filesystem::path &path,
-                               double duration_seconds,
-                               const clipdeck::ClipMuxerOptions &options) {
-  std::vector<std::string> arguments{
-      "ffmpeg",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-y",
-      "-f",
-      "lavfi",
-      "-i",
-      std::format("color=c=black:s={}x{}:r={}:d={}", options.width,
-                  options.height, options.fps,
-                  FormatSeconds(duration_seconds)),
-  };
-
-  if (options.audio_enabled) {
-    arguments.insert(arguments.end(),
-                     {"-f", "lavfi", "-i",
-                      "anullsrc=channel_layout=stereo:sample_rate=48000"});
-  }
-
-  arguments.insert(arguments.end(), {"-t", FormatSeconds(duration_seconds),
-                                     "-map", "0:v:0"});
-
-  if (options.audio_enabled) {
-    arguments.insert(arguments.end(), {"-map", "1:a:0"});
-  }
-
-  AppendVideoEncoderArguments(arguments, options);
-  if (options.audio_enabled) {
-    AppendAudioEncoderArguments(arguments, options);
-    arguments.emplace_back("-shortest");
-  }
-
-  arguments.insert(arguments.end(), {"-movflags", "+faststart", path.string()});
-
-  return RunCommand(std::move(arguments)) == 0;
-}
-
 int RunFfmpegCompose(const std::filesystem::path &manifest_path,
                      const std::filesystem::path &output_path,
                      double trim_start_seconds,
+                     double export_duration_seconds,
                      const clipdeck::ClipMuxerOptions &options) {
   std::vector<std::string> arguments{
       "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-      "-f",     "concat",      "-safe",    "0",     "-i",
+      "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i",
       manifest_path.string()};
 
   if (trim_start_seconds > 0.001) {
@@ -242,20 +366,52 @@ int RunFfmpegCompose(const std::filesystem::path &manifest_path,
   }
 
   arguments.insert(arguments.end(),
-                   {"-t", FormatSeconds(options.target_duration.count()), "-map",
-                    "0:v:0", "-map", "0:a:0?"});
+                   {"-t", FormatSeconds(export_duration_seconds), "-map",
+                    "0:v:0", "-map", "0:a:0?", "-r",
+                    std::to_string(options.fps)});
 
   AppendVideoEncoderArguments(arguments, options);
   if (options.audio_enabled) {
     AppendAudioEncoderArguments(arguments, options);
+    arguments.emplace_back("-ar");
+    arguments.emplace_back("48000");
+    arguments.emplace_back("-ac");
+    arguments.emplace_back("2");
   } else {
     arguments.insert(arguments.end(), {"-an"});
   }
 
   arguments.insert(arguments.end(),
-                   {"-movflags", "+faststart", output_path.string()});
+                   {"-avoid_negative_ts", "make_zero", "-movflags",
+                    "+faststart", output_path.string()});
 
-  return RunCommand(std::move(arguments));
+  return RunCommand(std::move(arguments),
+                    ComposeTimeout(export_duration_seconds, false));
+}
+
+int RunFfmpegComposeCopy(const std::filesystem::path &manifest_path,
+                         const std::filesystem::path &output_path,
+                         double trim_start_seconds,
+                         double export_duration_seconds,
+                         const clipdeck::ClipMuxerOptions &options) {
+  (void)options;
+  std::vector<std::string> arguments{
+      "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+      "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i",
+      manifest_path.string()};
+
+  if (trim_start_seconds > 0.001) {
+    arguments.insert(arguments.end(), {"-ss", FormatSeconds(trim_start_seconds)});
+  }
+
+  arguments.insert(arguments.end(),
+                   {"-t", FormatSeconds(export_duration_seconds), "-map",
+                    "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                    "-avoid_negative_ts", "make_zero", "-movflags",
+                    "+faststart", output_path.string()});
+
+  return RunCommand(std::move(arguments),
+                    ComposeTimeout(export_duration_seconds, true));
 }
 
 struct StagedSegments {
@@ -263,18 +419,70 @@ struct StagedSegments {
   double duration_seconds = 0.0;
 };
 
+bool TrustedRecorderSegmentLooksUsable(const std::filesystem::path &segment) {
+  std::error_code error;
+  return std::filesystem::is_regular_file(segment, error) && !error &&
+         segment.extension() == ".mp4" &&
+         std::filesystem::file_size(segment, error) > 0 && !error &&
+         clipdeck::IsFinalizedMp4Segment(segment);
+}
+
+bool IsStaleStagingDirectory(const std::filesystem::directory_entry &entry) {
+  std::error_code error;
+  if (!entry.is_directory(error) || error) {
+    return false;
+  }
+
+  return entry.path().filename().string().starts_with("clipdeck-compose-");
+}
+
+void CleanStaleStagingDirectories(
+    const std::filesystem::path &temp_directory) {
+  std::error_code error;
+  if (!std::filesystem::exists(temp_directory, error)) {
+    return;
+  }
+
+  for (const auto &entry :
+       std::filesystem::directory_iterator(temp_directory, error)) {
+    if (error) {
+      break;
+    }
+
+    if (!IsStaleStagingDirectory(entry)) {
+      continue;
+    }
+
+    std::error_code remove_error;
+    std::filesystem::remove_all(entry.path(), remove_error);
+  }
+}
+
 StagedSegments StageSegments(const std::vector<std::filesystem::path> &segments,
-                             const std::filesystem::path &staging_directory) {
+                             const std::filesystem::path &staging_directory,
+                             const clipdeck::ClipMuxerOptions &options) {
   StagedSegments staged;
   int index = 0;
 
   for (const auto &segment : segments) {
-    const auto source_duration = clipdeck::Mp4DurationSeconds(segment);
-    if (!source_duration.has_value()) {
+    if (options.trust_recorder_segments &&
+        !TrustedRecorderSegmentLooksUsable(segment)) {
       Log(LogLevel::Debug, kMuxerContext,
-          "Skipping segment without readable duration before staging: " +
+          "Skipping non-finalized recorder segment before staging: " +
               segment.string());
       continue;
+    }
+
+    if (!options.trust_recorder_segments) {
+      const auto source_probe = clipdeck::ProbeMediaFile(segment);
+      if (!source_probe.has_value() ||
+          !clipdeck::IsUsableRecorderSegment(source_probe.value(),
+                                             options.audio_enabled)) {
+        Log(LogLevel::Debug, kMuxerContext,
+            "Skipping unusable segment before staging: " +
+                segment.string());
+        continue;
+      }
     }
 
     const auto staged_path =
@@ -290,16 +498,26 @@ StagedSegments StageSegments(const std::vector<std::filesystem::path> &segments,
       continue;
     }
 
-    const auto staged_duration = clipdeck::Mp4DurationSeconds(staged_path);
-    if (!staged_duration.has_value()) {
-      Log(LogLevel::Warning, kMuxerContext,
-          "Staged segment is not readable: " + staged_path.string());
-      std::filesystem::remove(staged_path, copy_error);
-      continue;
-    }
-
     staged.paths.push_back(staged_path);
-    staged.duration_seconds += staged_duration.value();
+    if (!options.trust_recorder_segments) {
+      const auto staged_probe = clipdeck::ProbeMediaFile(staged_path);
+      if (!staged_probe.has_value() ||
+          !clipdeck::IsUsableRecorderSegment(staged_probe.value(),
+                                             options.audio_enabled)) {
+        Log(LogLevel::Warning, kMuxerContext,
+            "Staged segment is not usable: " + staged_path.string());
+        staged.paths.pop_back();
+        std::filesystem::remove(staged_path, copy_error);
+        continue;
+      }
+
+      staged.duration_seconds += staged_probe->duration_seconds;
+    }
+  }
+
+  if (options.trust_recorder_segments) {
+    staged.duration_seconds = options.available_duration_seconds.value_or(
+        static_cast<double>(staged.paths.size()));
   }
 
   return staged;
@@ -328,6 +546,7 @@ std::optional<std::filesystem::path>
 ClipMuxer::WriteClipFromSegments(
     const std::vector<std::filesystem::path> &segments,
     const ClipMuxerOptions &options) const {
+  SetLastFailure("");
   const double target_seconds =
       static_cast<double>(std::max(options.target_duration.count(), 1L));
 
@@ -335,60 +554,62 @@ ClipMuxer::WriteClipFromSegments(
   std::filesystem::create_directories(clip_directory_, error);
 
   if (error) {
-    HandleError(MakeError("clip_directory", kMuxerContext,
-                          "Failed to create clip directory: " +
-                              error.message()));
+    const std::string message =
+        "Failed to create clip directory: " + error.message();
+    SetLastFailure(message);
+    HandleError(MakeError("clip_directory", kMuxerContext, message));
     return std::nullopt;
   }
 
   std::filesystem::create_directories(temp_directory_, error);
   if (error) {
-    HandleError(MakeError("clip_temp_directory", kMuxerContext,
-                          "Failed to create clip temp directory: " +
-                              error.message()));
+    const std::string message =
+        "Failed to create clip temp directory: " + error.message();
+    SetLastFailure(message);
+    HandleError(MakeError("clip_temp_directory", kMuxerContext, message));
     return std::nullopt;
   }
+  CleanStaleStagingDirectories(temp_directory_);
 
   const auto staging_directory = BuildStagingDirectory();
   std::filesystem::create_directories(staging_directory, error);
   if (error) {
-    HandleError(MakeError("clip_staging_directory", kMuxerContext,
-                          "Failed to create clip staging directory: " +
-                              error.message()));
+    const std::string message =
+        "Failed to create clip staging directory: " + error.message();
+    SetLastFailure(message);
+    HandleError(MakeError("clip_staging_directory", kMuxerContext, message));
+    return std::nullopt;
+  }
+  ScopedDirectoryCleanup cleanup_staging(staging_directory);
+
+  auto staged = StageSegments(segments, staging_directory, options);
+  if (staged.paths.empty()) {
+    const std::string message =
+        "No finalized recorder segments are available yet; refusing to publish a blank clip.";
+    SetLastFailure(message);
+    Log(LogLevel::Warning, kMuxerContext, message);
     return std::nullopt;
   }
 
-  const auto cleanup_staging = [&] {
-    std::error_code cleanup_error;
-    std::filesystem::remove_all(staging_directory, cleanup_error);
-  };
-
-  auto staged = StageSegments(segments, staging_directory);
-  if (staged.paths.empty()) {
-    Log(LogLevel::Warning, kMuxerContext,
-        "No finalized recorder segments were available; creating a black clip.");
-  }
-
-  const double padding_seconds =
-      std::max(0.0, target_seconds - staged.duration_seconds);
-  std::vector<std::filesystem::path> compose_paths;
-  double compose_duration = staged.duration_seconds;
-
-  if (padding_seconds > 0.001) {
-    const auto padding_path = staging_directory / "black-padding.mp4";
-    if (!CreateBlackPaddingSegment(padding_path, padding_seconds, options)) {
-      HandleError(MakeError("clip_padding", kMuxerContext,
-                            "ffmpeg failed to create black padding segment."));
-      cleanup_staging();
-      return std::nullopt;
-    }
-
-    compose_paths.push_back(padding_path);
-    compose_duration += padding_seconds;
-  }
-
-  compose_paths.insert(compose_paths.end(), staged.paths.begin(),
-                       staged.paths.end());
+  const double available_duration_seconds =
+      std::isfinite(staged.duration_seconds) && staged.duration_seconds > 0.0
+          ? staged.duration_seconds
+          : static_cast<double>(staged.paths.size());
+  const double export_duration_seconds =
+      std::min(available_duration_seconds, target_seconds);
+  const double trim_seconds =
+      std::max(0.0, available_duration_seconds - export_duration_seconds);
+  const bool shortened = available_duration_seconds + 0.001 < target_seconds;
+  Log(LogLevel::Info, kMuxerContext,
+      "Preparing clip: requested_duration=" + FormatSeconds(target_seconds) +
+          "s, real_available_duration=" +
+          FormatSeconds(available_duration_seconds) +
+          "s, final_exported_duration=" +
+          FormatSeconds(export_duration_seconds) +
+          "s, selected_segment_count=" +
+          std::to_string(staged.paths.size()) +
+          ", shortened=" + (shortened ? "true" : "false") +
+          ", trim_duration=" + FormatSeconds(trim_seconds) + "s.");
 
   const auto manifest_path = staging_directory / "concat.txt";
   const auto temp_output_path = staging_directory / "clipdeck-output.mp4";
@@ -396,43 +617,110 @@ ClipMuxer::WriteClipFromSegments(
 
   std::ofstream manifest(manifest_path, std::ios::trunc);
   if (!manifest.is_open()) {
-    HandleError(MakeError("clip_manifest", kMuxerContext,
-                          "Failed to open concat manifest: " +
-                              manifest_path.string()));
-    cleanup_staging();
+    const std::string message =
+        "Failed to open concat manifest: " + manifest_path.string();
+    SetLastFailure(message);
+    HandleError(MakeError("clip_manifest", kMuxerContext, message));
     return std::nullopt;
   }
 
-  for (const auto &segment : compose_paths) {
+  for (const auto &segment : staged.paths) {
     manifest << "file '" << EscapeConcatPath(std::filesystem::absolute(segment))
              << "'\n";
   }
   manifest.close();
 
   const double trim_start_seconds =
-      std::max(0.0, compose_duration - target_seconds);
-  const int exit_code =
-      RunFfmpegCompose(manifest_path, temp_output_path, trim_start_seconds,
-                       options);
+      std::max(0.0, available_duration_seconds - export_duration_seconds);
+  const bool can_try_stream_copy = true;
+  int exit_code = -1;
+  if (can_try_stream_copy) {
+    Log(LogLevel::Info, kMuxerContext,
+        "Composing clip with stream-copy fast path.");
+    exit_code = RunFfmpegComposeCopy(manifest_path, temp_output_path,
+                                     trim_start_seconds, export_duration_seconds,
+                                     options);
+    const auto copy_probe = ProbeMediaFile(temp_output_path);
+    if (exit_code == 0 &&
+        FinalClipPassesValidation(copy_probe, options,
+                                  export_duration_seconds)) {
+      if (!options.validate_black_frames) {
+        Log(LogLevel::Info, kMuxerContext,
+            "Stream-copy compose passed validation.");
+      } else {
+        const auto black_validation = ValidateNotMostlyBlack(
+            temp_output_path, copy_probe->duration_seconds);
+        if (black_validation.valid) {
+          Log(LogLevel::Info, kMuxerContext,
+              "Stream-copy compose passed validation.");
+        } else {
+          Log(LogLevel::Warning, kMuxerContext,
+              "Stream-copy compose produced invalid video; falling back to normalized re-encode: " +
+                  black_validation.message);
+          std::error_code remove_error;
+          std::filesystem::remove(temp_output_path, remove_error);
+          exit_code = RunFfmpegCompose(manifest_path, temp_output_path,
+                                       trim_start_seconds,
+                                       export_duration_seconds, options);
+        }
+      }
+    } else {
+      std::error_code remove_error;
+      std::filesystem::remove(temp_output_path, remove_error);
+      Log(LogLevel::Warning, kMuxerContext,
+          "Stream-copy compose did not validate; falling back to normalized re-encode.");
+      exit_code = RunFfmpegCompose(manifest_path, temp_output_path,
+                                   trim_start_seconds,
+                                   export_duration_seconds, options);
+    }
+  } else {
+    exit_code = RunFfmpegCompose(manifest_path, temp_output_path,
+                                 trim_start_seconds, export_duration_seconds,
+                                 options);
+  }
 
   if (exit_code != 0) {
-    HandleError(MakeError("clip_compose", kMuxerContext,
-                          "ffmpeg failed to compose clip, exit code " +
-                              std::to_string(exit_code) + "."));
-    cleanup_staging();
+    const std::string message =
+        "ffmpeg failed to compose clip, exit code " +
+        std::to_string(exit_code) + ".";
+    SetLastFailure(message);
+    HandleError(MakeError("clip_compose", kMuxerContext, message));
     return std::nullopt;
+  }
+
+  const auto final_probe = ProbeMediaFile(temp_output_path);
+  if (!FinalClipPassesValidation(final_probe, options,
+                                 export_duration_seconds)) {
+    const std::string reason =
+        FinalClipValidationFailure(final_probe, options,
+                                   export_duration_seconds);
+    const std::string message = "Composed clip failed validation: " + reason;
+    SetLastFailure(message);
+    HandleError(MakeError("clip_empty", kMuxerContext, message));
+    std::error_code status_error;
+    std::filesystem::remove(temp_output_path, status_error);
+    return std::nullopt;
+  }
+
+  if (options.validate_black_frames) {
+    const auto black_validation =
+        ValidateNotMostlyBlack(temp_output_path, final_probe->duration_seconds);
+    if (!black_validation.valid) {
+      const std::string message =
+          "Composed clip failed validation: " + black_validation.message +
+          " (sampled_frames=" +
+          std::to_string(black_validation.sampled_frames) +
+          ", black_frames=" + std::to_string(black_validation.black_frames) +
+          ").";
+      SetLastFailure(message);
+      HandleError(MakeError("clip_black", kMuxerContext, message));
+      std::error_code status_error;
+      std::filesystem::remove(temp_output_path, status_error);
+      return std::nullopt;
+    }
   }
 
   std::error_code status_error;
-  if (!std::filesystem::exists(temp_output_path, status_error) ||
-      std::filesystem::file_size(temp_output_path, status_error) == 0) {
-    HandleError(MakeError("clip_empty", kMuxerContext,
-                          "Composed clip is missing or empty: " +
-                              temp_output_path.string()));
-    cleanup_staging();
-    return std::nullopt;
-  }
-
   std::filesystem::rename(temp_output_path, clip_path, error);
   if (error) {
     error.clear();
@@ -440,18 +728,21 @@ ClipMuxer::WriteClipFromSegments(
                                std::filesystem::copy_options::overwrite_existing,
                                error);
     if (error) {
-      HandleError(MakeError("clip_publish", kMuxerContext,
-                            "Failed to publish final clip: " +
-                                error.message()));
-      cleanup_staging();
+      const std::string message =
+          "Failed to publish final clip: " + error.message();
+      SetLastFailure(message);
+      HandleError(MakeError("clip_publish", kMuxerContext, message));
       return std::nullopt;
     }
     std::filesystem::remove(temp_output_path, status_error);
   }
 
-  cleanup_staging();
+  Log(LogLevel::Info, kMuxerContext,
+      "Published validated clip: " + clip_path.string() + ".");
   return clip_path;
 }
+
+std::string ClipMuxer::LastFailure() const { return last_failure_; }
 
 std::filesystem::path ClipMuxer::BuildClipPath() const {
   return clip_directory_ / ("clipdeck-" + TimestampForFilename() + ".mp4");
@@ -461,6 +752,10 @@ std::filesystem::path ClipMuxer::BuildStagingDirectory() const {
   return temp_directory_ /
          ("clipdeck-compose-" + TimestampForFilename() + "-" +
           std::to_string(getpid()));
+}
+
+void ClipMuxer::SetLastFailure(std::string failure) const {
+  last_failure_ = std::move(failure);
 }
 
 } // namespace clipdeck

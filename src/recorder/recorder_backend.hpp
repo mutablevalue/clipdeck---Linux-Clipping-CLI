@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace clipdeck {
@@ -16,6 +17,16 @@ struct RecorderStatus {
   std::chrono::milliseconds buffered_duration{0};
   std::size_t buffered_bytes = 0;
   std::size_t memory_budget_bytes = 0;
+  std::size_t finalized_segment_count = 0;
+  std::chrono::milliseconds finalized_segment_duration{0};
+  bool can_save_any_clip = false;
+  bool can_save_full_clip_without_padding = false;
+  std::string last_capture_anomaly;
+  std::string last_save_failure;
+  std::filesystem::path last_saved_clip;
+  std::optional<int> audio_sample_rate;
+  std::optional<int> audio_channels;
+  bool audio_enabled = false;
 };
 
 struct RecorderConfig {

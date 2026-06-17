@@ -49,4 +49,17 @@ TEST(GStreamerRecorderTest, AddsAudioOnlyWhenEnabledAndResolved) {
 
   EXPECT_NE(pipeline.find("pulsesrc name=clipdeck_output_audio_source device=\"alsa_output.test.monitor\""),
             std::string::npos);
+  EXPECT_NE(pipeline.find("audioconvert"), std::string::npos);
+  EXPECT_NE(pipeline.find("audioresample"), std::string::npos);
+  EXPECT_NE(pipeline.find("rate=48000"), std::string::npos);
+  EXPECT_NE(pipeline.find("channels=2"), std::string::npos);
+  EXPECT_NE(pipeline.find("aacparse"), std::string::npos);
+  const bool uses_fdk = pipeline.find("fdkaacenc") != std::string::npos;
+  const bool uses_avenc = pipeline.find("avenc_aac") != std::string::npos;
+  EXPECT_TRUE(uses_fdk || uses_avenc);
+  if (uses_fdk) {
+    EXPECT_NE(pipeline.find("audio/x-raw,format=S16LE"), std::string::npos);
+  } else {
+    EXPECT_NE(pipeline.find("audio/x-raw,format=F32LE"), std::string::npos);
+  }
 }
