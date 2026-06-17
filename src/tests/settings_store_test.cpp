@@ -22,6 +22,7 @@ TEST(SettingsStoreTest, LoadsDefaultsWhenFileDoesNotExist) {
   EXPECT_EQ(settings.clip_length_seconds, 30);
   EXPECT_EQ(settings.buffer_safety_seconds, 5);
   EXPECT_EQ(settings.save_keybind, "Ctrl+Z+P");
+  EXPECT_EQ(settings.stop_keybind, "Ctrl+Z+O");
   EXPECT_EQ(settings.clip_directory, settings_path.parent_path() / "clips");
   EXPECT_EQ(settings.capture_video_source, "portal");
   EXPECT_TRUE(settings.capture_audio_enabled);
@@ -45,8 +46,9 @@ TEST(SettingsStoreTest, SavesAndLoadsSettings) {
   saved_settings.clip_length_seconds = 45;
   saved_settings.buffer_safety_seconds = 8;
   saved_settings.save_keybind = "Ctrl+Alt+P";
+  saved_settings.stop_keybind = "Ctrl+Alt+O";
   saved_settings.clip_directory = "/tmp/clipdeck-clips";
-  saved_settings.capture_video_source = "42";
+  saved_settings.capture_video_source = "portal";
   saved_settings.capture_audio_enabled = false;
   saved_settings.capture_audio_source = "alsa_output.test.monitor";
   saved_settings.capture_width = 1280;
@@ -66,6 +68,7 @@ TEST(SettingsStoreTest, SavesAndLoadsSettings) {
   EXPECT_EQ(loaded_settings.clip_length_seconds, 45);
   EXPECT_EQ(loaded_settings.buffer_safety_seconds, 8);
   EXPECT_EQ(loaded_settings.save_keybind, "Ctrl+Alt+P");
+  EXPECT_EQ(loaded_settings.stop_keybind, "Ctrl+Alt+O");
   EXPECT_EQ(loaded_settings.clip_directory, "/tmp/clipdeck-clips");
   EXPECT_EQ(loaded_settings.capture_video_source, "portal");
   EXPECT_FALSE(loaded_settings.capture_audio_enabled);

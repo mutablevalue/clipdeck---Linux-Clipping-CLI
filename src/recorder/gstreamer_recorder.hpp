@@ -31,6 +31,7 @@ public:
   void SetPortalTestTargetObject(int fd, std::uint32_t node_id,
                                  std::string target_object);
   void SetPortalTestPath(int fd, std::uint32_t node_id);
+  void SetPortalTestCaptureSourceType(std::string source_type);
   [[nodiscard]] std::string BuildPipelineDescriptionForTest() const;
 #endif
 
@@ -54,6 +55,7 @@ private:
   std::atomic_bool running_{false};
   bool healthy_ = false;
   std::string message_ = "not started";
+  std::string capture_source_type_;
   std::string last_capture_anomaly_;
   std::string last_save_failure_;
   std::filesystem::path last_saved_clip_;

@@ -27,6 +27,8 @@ namespace {
 
 constexpr std::string_view kRecorderContext = "native-recorder";
 constexpr int kSegmentSeconds = 1;
+constexpr std::uint32_t kPortalMonitorSource = 1;
+constexpr std::uint32_t kPortalWindowSource = 2;
 
 struct RecorderSegmentSummary {
   std::size_t count = 0;
@@ -115,6 +117,26 @@ std::string LiveEncodedAudioQueue(const clipdeck::RecorderConfig &config) {
                                            512 * 1024));
 }
 
+bool IsSupportedVideoSource(std::string_view source) {
+  return source.empty() || source == "portal";
+}
+
+std::uint32_t PortalSourceMask() {
+  return kPortalMonitorSource | kPortalWindowSource;
+}
+
+std::string PortalSourceName(std::uint32_t source_type) {
+  if (source_type == kPortalMonitorSource) {
+    return "monitor";
+  }
+
+  if (source_type == kPortalWindowSource) {
+    return "window";
+  }
+
+  return "unknown";
+}
+
 #if defined(CLIPDECK_HAS_GSTREAMER)
 bool GstElementAvailable(std::string_view factory_name) {
   GstElementFactory *factory =
@@ -146,6 +168,7 @@ struct PortalSession {
   GDBusConnection *connection = nullptr;
   int fd = -1;
   std::uint32_t node_id = 0;
+  std::uint32_t source_type = 0;
   std::optional<std::string> target_object;
   std::string session_handle;
 };
@@ -339,9 +362,8 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
   const auto select_token = PortalToken("clipdeckselect");
   g_variant_builder_add(&select_options, "{sv}", "handle_token",
                         g_variant_new_string(select_token.c_str()));
-  constexpr std::uint32_t monitor_capture = 1;
   g_variant_builder_add(&select_options, "{sv}", "types",
-                        g_variant_new_uint32(monitor_capture));
+                        g_variant_new_uint32(PortalSourceMask()));
   g_variant_builder_add(&select_options, "{sv}", "multiple",
                         g_variant_new_boolean(FALSE));
 
@@ -406,8 +428,9 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
   }
   g_variant_unref(start_results.value());
 
-  constexpr std::uint32_t monitor_source_type = 1;
-  if (!source_type.has_value() || source_type.value() != monitor_source_type) {
+  const auto allowed_source_types = PortalSourceMask();
+  if (!source_type.has_value() ||
+      (source_type.value() & allowed_source_types) == 0) {
     ClosePortalSession(connection, owned_session_handle);
     g_free(session_handle);
     g_object_unref(connection);
@@ -416,7 +439,7 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
                                 : std::string("<missing>");
     Log(LogLevel::Error, kRecorderContext,
         "Portal returned screen cast source type " + returned_type +
-            ", not MONITOR. Refusing to record because ClipDeck is screen-only.");
+            ", which is not a monitor or window source.");
     return std::nullopt;
   }
 
@@ -486,10 +509,11 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
           (pipewire_serial.has_value()
                ? " serial " + std::to_string(pipewire_serial.value())
                : std::string()) +
-          " for monitor capture.");
+          " for " + PortalSourceName(source_type.value()) + " capture.");
   return PortalSession{.connection = connection,
                        .fd = fd,
                        .node_id = node_id,
+                       .source_type = source_type.value(),
                        .target_object =
                            pipewire_serial.has_value()
                                ? std::optional<std::string>{
@@ -611,8 +635,10 @@ bool GStreamerRecorder::Start() {
   EnsureGStreamerInitialized();
   CleanSegmentDirectory();
 
-  if (!config_.video_source.empty() && config_.video_source != "portal") {
-    SetMessage("Native recorder only supports portal screen capture.", false);
+  if (!IsSupportedVideoSource(config_.video_source)) {
+    SetMessage(
+        "Native recorder supports the portal video source.",
+        false);
     Log(LogLevel::Error, kRecorderContext, message_);
     return false;
   }
@@ -626,15 +652,18 @@ bool GStreamerRecorder::Start() {
 
   portal_fd_ = portal->fd;
   portal_node_id_ = portal->node_id;
+  capture_source_type_ = PortalSourceName(portal->source_type);
   portal_target_object_ = portal->target_object;
   portal_session_handle_ = portal->session_handle;
   portal_connection_ = portal->connection;
   Log(LogLevel::Info, kRecorderContext,
       portal_target_object_.has_value()
-          ? "Using portal monitor PipeWire serial target " +
-                portal_target_object_.value() + "."
-          : "Using portal monitor PipeWire node path " +
-                std::to_string(portal_node_id_) + " on the portal remote.");
+          ? "Using portal PipeWire serial target " +
+                portal_target_object_.value() + " for " +
+                capture_source_type_ + " capture."
+          : "Using portal PipeWire node path " +
+                std::to_string(portal_node_id_) + " on the portal remote for " +
+                capture_source_type_ + " capture.");
 
   GError *error = nullptr;
   const std::string pipeline_description = BuildPipelineDescription();
@@ -655,6 +684,7 @@ bool GStreamerRecorder::Start() {
       close(portal_fd_);
       portal_fd_ = -1;
       portal_node_id_ = 0;
+      capture_source_type_.clear();
       portal_target_object_.reset();
     }
 #if defined(CLIPDECK_HAS_GSTREAMER)
@@ -680,6 +710,7 @@ bool GStreamerRecorder::Start() {
       close(portal_fd_);
       portal_fd_ = -1;
       portal_node_id_ = 0;
+      capture_source_type_.clear();
       portal_target_object_.reset();
     }
 #if defined(CLIPDECK_HAS_GSTREAMER)
@@ -715,6 +746,7 @@ bool GStreamerRecorder::Start() {
       close(portal_fd_);
       portal_fd_ = -1;
       portal_node_id_ = 0;
+      capture_source_type_.clear();
       portal_target_object_.reset();
     }
 #if defined(CLIPDECK_HAS_GSTREAMER)
@@ -784,6 +816,7 @@ void GStreamerRecorder::Stop() {
     close(portal_fd_);
     portal_fd_ = -1;
     portal_node_id_ = 0;
+    capture_source_type_.clear();
     portal_target_object_.reset();
   }
 #if defined(CLIPDECK_HAS_GSTREAMER)
@@ -899,6 +932,7 @@ RecorderStatus GStreamerRecorder::Status() const {
   bool running = false;
   bool healthy = false;
   std::string message;
+  std::string capture_source_type;
   std::string last_capture_anomaly;
   std::string last_save_failure;
   std::filesystem::path last_saved_clip;
@@ -907,6 +941,7 @@ RecorderStatus GStreamerRecorder::Status() const {
     running = running_;
     healthy = healthy_;
     message = message_;
+    capture_source_type = capture_source_type_;
     last_capture_anomaly = last_capture_anomaly_;
     last_save_failure = last_save_failure_;
     last_saved_clip = last_saved_clip_;
@@ -919,6 +954,7 @@ RecorderStatus GStreamerRecorder::Status() const {
                         .healthy = healthy,
                         .backend = "native",
                         .message = message,
+                        .capture_source_type = capture_source_type,
                         .buffered_duration =
                             std::chrono::seconds(count * kSegmentSeconds),
                         .buffered_bytes = SegmentBytes(),
@@ -950,6 +986,12 @@ void GStreamerRecorder::SetPortalTestPath(int fd, std::uint32_t node_id) {
   portal_fd_ = fd;
   portal_node_id_ = node_id;
   portal_target_object_.reset();
+}
+
+void GStreamerRecorder::SetPortalTestCaptureSourceType(
+    std::string source_type) {
+  std::scoped_lock lock(state_mutex_);
+  capture_source_type_ = std::move(source_type);
 }
 
 std::string GStreamerRecorder::BuildPipelineDescriptionForTest() const {

@@ -225,7 +225,7 @@ bool SetupNativeRecorder(ClipDeckSettings &settings) {
   }
 
   Log(LogLevel::Info, kSetupContext,
-      "Video source: portal screen capture only.");
+      "Video source: portal picker for monitor or window capture.");
 
   if (settings.capture_audio_source.empty()) {
     settings.capture_audio_source = std::string(kAutomaticAudioSource);

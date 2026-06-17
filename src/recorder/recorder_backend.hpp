@@ -14,6 +14,7 @@ struct RecorderStatus {
   bool healthy = false;
   std::string backend = "native";
   std::string message;
+  std::string capture_source_type;
   std::chrono::milliseconds buffered_duration{0};
   std::size_t buffered_bytes = 0;
   std::size_t memory_budget_bytes = 0;

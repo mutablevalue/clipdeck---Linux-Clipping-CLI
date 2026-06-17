@@ -57,14 +57,51 @@ bool DeviceExposesKeybindRequirements(
   });
 }
 
+std::optional<std::vector<clipdeck::KeyRequirement>>
+ConfiguredKeybindRequirements(const clipdeck::ListenerConfig &config,
+                              std::string &last_error) {
+  std::vector<clipdeck::KeyRequirement> requirements;
+
+  const auto save_requirements =
+      clipdeck::ParseKeybindRequirements(config.save_keybind);
+  if (!save_requirements.has_value()) {
+    last_error =
+        "Configured save keybind is not supported by the Linux input listener.";
+    return std::nullopt;
+  }
+  requirements.insert(requirements.end(), save_requirements->begin(),
+                      save_requirements->end());
+
+  const auto stop_requirements =
+      clipdeck::ParseKeybindRequirements(config.stop_keybind);
+  if (!stop_requirements.has_value()) {
+    last_error =
+        "Configured stop keybind is not supported by the Linux input listener.";
+    return std::nullopt;
+  }
+  requirements.insert(requirements.end(), stop_requirements->begin(),
+                      stop_requirements->end());
+
+  return requirements;
+}
+
 } // namespace
 
 namespace clipdeck {
 
 DaemonListener::DaemonListener(ListenerConfig config)
     : config_(std::move(config)),
+      keybinds_({KeybindActionState{.action = "save",
+                                    .keybind = config_.save_keybind,
+                                    .was_down = false,
+                                    .last_detected_at = std::nullopt},
+                 KeybindActionState{.action = "stop",
+                                    .keybind = config_.stop_keybind,
+                                    .was_down = false,
+                                    .last_detected_at = std::nullopt}}),
       status_(ListenerStatus{.running = false,
                              .save_keybind = config_.save_keybind,
+                             .stop_keybind = config_.stop_keybind,
                              .input_directory = config_.input_directory,
                              .scanned_devices = 0,
                              .readable_devices = 0,
@@ -87,7 +124,8 @@ void DaemonListener::Start() {
 
   Log(LogLevel::Info, kListenerContext,
       "Started global Linux input keybind listener. Save keybind: " +
-          config_.save_keybind + ".");
+          config_.save_keybind + ". Stop keybind: " + config_.stop_keybind +
+          ".");
 }
 
 void DaemonListener::Stop() {
@@ -189,10 +227,11 @@ void DaemonListener::RescanInputDevices() {
   int accepted_keyboard_devices = static_cast<int>(input_devices_.size());
   std::string last_error;
 
-  const auto requirements = ParseKeybindRequirements(config_.save_keybind);
+  std::string keybind_error;
+  const auto requirements = ConfiguredKeybindRequirements(config_, keybind_error);
   if (!requirements.has_value()) {
     UpdateStatusCounts(0, readable_devices, accepted_keyboard_devices,
-                       "Configured save keybind is not supported by the Linux input listener.");
+                       keybind_error);
     return;
   }
 
@@ -235,7 +274,7 @@ void DaemonListener::RescanInputDevices() {
       if (!DeviceExposesKeybindRequirements(
               device_descriptor.Get(), requirements.value())) {
         last_error = entry.path().string() +
-                     ": readable but does not expose the configured keybind";
+                     ": readable but does not expose the configured keybinds";
         continue;
       }
 
@@ -272,7 +311,7 @@ void DaemonListener::RescanInputDevices() {
       "Scanned " + std::to_string(scanned_devices) + " input event devices, " +
           std::to_string(readable_devices) + " readable, " +
           std::to_string(accepted_keyboard_devices) +
-          " accepted for the configured save keybind.");
+          " accepted for the configured keybinds.");
 }
 
 void DaemonListener::RemoveBrokenDevices(
@@ -325,29 +364,33 @@ void DaemonListener::HandleInputEvent(int event_type, int event_code,
     return;
   }
 
-  const bool is_down = SaveKeybindIsPressed();
   const auto now = std::chrono::steady_clock::now();
-  if (is_down && !save_keybind_was_down_ && KeybindDebouncePassed(now)) {
-    last_keybind_detected_at_ = now;
-    MarkKeybindDetected();
-    Log(LogLevel::Info, kListenerContext,
-        "Global save keybind detected.");
+  for (auto &keybind : keybinds_) {
+    const bool is_down = KeybindIsPressed(keybind.keybind);
+    if (is_down && !keybind.was_down && KeybindDebouncePassed(keybind, now)) {
+      keybind.last_detected_at = now;
+      MarkKeybindDetected();
+      Log(LogLevel::Info, kListenerContext,
+          "Global " + keybind.action + " keybind detected.");
 
-    if (keybind_callback_) {
-      keybind_callback_("save");
+      if (keybind_callback_) {
+        keybind_callback_(keybind.action);
+      }
     }
-  }
 
-  save_keybind_was_down_ = is_down;
+    keybind.was_down = is_down;
+  }
 }
 
 void DaemonListener::ResetKeyState() {
   pressed_key_codes_.clear();
-  save_keybind_was_down_ = false;
+  for (auto &keybind : keybinds_) {
+    keybind.was_down = false;
+  }
 }
 
-bool DaemonListener::SaveKeybindIsPressed() const {
-  const auto requirements = ParseKeybindRequirements(config_.save_keybind);
+bool DaemonListener::KeybindIsPressed(std::string_view keybind) const {
+  const auto requirements = ParseKeybindRequirements(keybind);
 
   if (!requirements.has_value()) {
     return false;
@@ -362,9 +405,10 @@ bool DaemonListener::SaveKeybindIsPressed() const {
 }
 
 bool DaemonListener::KeybindDebouncePassed(
+    const KeybindActionState &keybind,
     std::chrono::steady_clock::time_point now) const {
-  return !last_keybind_detected_at_.has_value() ||
-         now - last_keybind_detected_at_.value() >= config_.keybind_debounce;
+  return !keybind.last_detected_at.has_value() ||
+         now - keybind.last_detected_at.value() >= config_.keybind_debounce;
 }
 
 void DaemonListener::UpdateStatusCounts(int scanned_devices, int readable_devices,
@@ -373,6 +417,7 @@ void DaemonListener::UpdateStatusCounts(int scanned_devices, int readable_device
   std::scoped_lock lock(status_mutex_);
   status_.running = running_;
   status_.save_keybind = config_.save_keybind;
+  status_.stop_keybind = config_.stop_keybind;
   status_.input_directory = config_.input_directory;
   status_.scanned_devices = scanned_devices;
   status_.readable_devices = readable_devices;

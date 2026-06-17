@@ -63,3 +63,13 @@ TEST(GStreamerRecorderTest, AddsAudioOnlyWhenEnabledAndResolved) {
     EXPECT_NE(pipeline.find("audio/x-raw,format=F32LE"), std::string::npos);
   }
 }
+
+TEST(GStreamerRecorderTest, ReportsPortalCaptureSourceType) {
+  clipdeck::RecorderConfig config;
+  config.audio_enabled = false;
+  clipdeck::GStreamerRecorder recorder(config);
+
+  recorder.SetPortalTestCaptureSourceType("window");
+
+  EXPECT_EQ(recorder.Status().capture_source_type, "window");
+}

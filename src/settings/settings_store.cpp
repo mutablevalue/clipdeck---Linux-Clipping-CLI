@@ -90,18 +90,23 @@ ClipDeckSettings SettingsStore::Load() const {
       continue;
     }
 
+    if (key == "stop_keybind" && !value.empty()) {
+      settings.stop_keybind = value;
+      continue;
+    }
+
     if (key == "clip_directory" && !value.empty()) {
       settings.clip_directory = ResolveStoredPath(value);
       continue;
     }
 
     if (key == "capture_video_source" && !value.empty()) {
-      if (value == "portal") {
-        settings.capture_video_source = value;
-      } else {
+      if (value != "portal") {
         settings.capture_video_source = "portal";
         Log(LogLevel::Warning, kSettingsContext,
-            "Ignored non-portal video source from settings; native capture is screen-only.");
+            "Ignored legacy video source from settings; native capture uses the XDG portal picker.");
+      } else {
+        settings.capture_video_source = value;
       }
       continue;
     }
@@ -217,6 +222,7 @@ bool SettingsStore::Save(const ClipDeckSettings &settings) const {
   output << "clip_length_seconds=" << settings.clip_length_seconds << '\n';
   output << "buffer_safety_seconds=" << settings.buffer_safety_seconds << '\n';
   output << "save_keybind=" << settings.save_keybind << '\n';
+  output << "stop_keybind=" << settings.stop_keybind << '\n';
   output << "clip_directory=" << settings.clip_directory.string() << '\n';
   output << "capture_video_source=" << settings.capture_video_source << '\n';
   output << "capture_audio_enabled="

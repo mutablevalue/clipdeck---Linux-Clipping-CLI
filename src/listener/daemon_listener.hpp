@@ -17,6 +17,7 @@ namespace clipdeck {
 
 struct ListenerConfig {
   std::string save_keybind = "Ctrl+Z+P";
+  std::string stop_keybind = "Ctrl+Z+O";
   std::filesystem::path input_directory = "/dev/input";
   std::chrono::milliseconds keybind_debounce{1000};
 };
@@ -24,6 +25,7 @@ struct ListenerConfig {
 struct ListenerStatus {
   bool running = false;
   std::string save_keybind = "Ctrl+Z+P";
+  std::string stop_keybind = "Ctrl+Z+O";
   std::filesystem::path input_directory = "/dev/input";
   int scanned_devices = 0;
   int readable_devices = 0;
@@ -58,13 +60,21 @@ private:
     FileDescriptor descriptor;
   };
 
+  struct KeybindActionState {
+    std::string action;
+    std::string keybind;
+    bool was_down = false;
+    std::optional<std::chrono::steady_clock::time_point> last_detected_at;
+  };
+
   void ListenLoop(std::stop_token stop_token);
   void RescanInputDevices();
   void RemoveBrokenDevices(const std::vector<std::size_t> &broken_indices);
   void HandleInputEvent(int event_type, int event_code, int event_value);
   void ResetKeyState();
-  [[nodiscard]] bool SaveKeybindIsPressed() const;
+  [[nodiscard]] bool KeybindIsPressed(std::string_view keybind) const;
   [[nodiscard]] bool KeybindDebouncePassed(
+      const KeybindActionState &keybind,
       std::chrono::steady_clock::time_point now) const;
   void UpdateStatusCounts(int scanned_devices, int readable_devices,
                           int accepted_keyboard_devices,
@@ -77,9 +87,7 @@ private:
   std::jthread listener_thread_;
   std::vector<InputDevice> input_devices_;
   std::vector<int> pressed_key_codes_;
-  bool save_keybind_was_down_ = false;
-  std::optional<std::chrono::steady_clock::time_point>
-      last_keybind_detected_at_;
+  std::vector<KeybindActionState> keybinds_;
   mutable std::mutex status_mutex_;
   ListenerStatus status_;
 };

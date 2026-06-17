@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 namespace clipdeck {
 
 class CommandHandler {
@@ -8,7 +10,7 @@ public:
 
 private:
   int RunSettingsCommand(int argc, char *argv[]) const;
-  int SetKeybindFromCapture() const;
+  int SetKeybindFromCapture(std::string_view action) const;
   void PrintHelp() const;
 };
 

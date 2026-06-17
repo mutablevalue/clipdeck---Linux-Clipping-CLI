@@ -29,6 +29,7 @@ namespace {
 constexpr std::string_view kCoreContext = "core";
 volatile std::sig_atomic_t shutdown_requested = 0;
 volatile std::sig_atomic_t save_requested = 0;
+volatile std::sig_atomic_t choose_capture_requested = 0;
 
 void HandleShutdownSignal(int) {
   shutdown_requested = 1;
@@ -38,6 +39,10 @@ void HandleSaveSignal(int) {
   save_requested = 1;
 }
 
+void HandleChooseCaptureSignal(int) {
+  choose_capture_requested = 1;
+}
+
 std::string BoolString(bool value) { return value ? "true" : "false"; }
 
 std::string RecorderStatusLine(const clipdeck::RecorderStatus &status) {
@@ -45,6 +50,7 @@ std::string RecorderStatusLine(const clipdeck::RecorderStatus &status) {
          "running=" + (status.running ? std::string("true") : "false") + "\n" +
          "healthy=" + (status.healthy ? std::string("true") : "false") + "\n" +
          "message=" + status.message + "\n" +
+         "capture_source_type=" + status.capture_source_type + "\n" +
          "buffered_milliseconds=" +
          std::to_string(status.buffered_duration.count()) + "\n" +
          "buffered_bytes=" + std::to_string(status.buffered_bytes) + "\n" +
@@ -96,6 +102,7 @@ std::string ListenerStatusLine(
 
   return "running=" + BoolString(listener_status.running) + "\n" +
          "save_keybind=" + listener_status.save_keybind + "\n" +
+         "stop_keybind=" + listener_status.stop_keybind + "\n" +
          "input_directory=" + listener_status.input_directory.string() + "\n" +
          "scanned_devices=" +
          std::to_string(listener_status.scanned_devices) + "\n" +
@@ -422,9 +429,11 @@ void ClipDeckCore::Start() {
 int ClipDeckCore::RunListener() {
   shutdown_requested = 0;
   save_requested = 0;
+  choose_capture_requested = 0;
   std::signal(SIGINT, HandleShutdownSignal);
   std::signal(SIGTERM, HandleShutdownSignal);
   std::signal(SIGUSR1, HandleSaveSignal);
+  std::signal(SIGUSR2, HandleChooseCaptureSignal);
 
   DaemonListener listener(BuildListenerConfig());
 
@@ -436,6 +445,7 @@ int ClipDeckCore::RunListener() {
                                          .healthy = false,
                                          .backend = "native",
                                          .message = "starting",
+                                         .capture_source_type = "",
                                          .buffered_duration =
                                              std::chrono::milliseconds(0),
                                          .buffered_bytes = 0,
@@ -475,6 +485,13 @@ int ClipDeckCore::RunListener() {
   FeedbackNotifier feedback_notifier(settings_);
 
   listener.SetKeybindCallback([&](std::string_view action) {
+    if (action == "stop") {
+      Log(LogLevel::Info, kCoreContext,
+          "Accepted keybind stop request.");
+      shutdown_requested = 1;
+      return;
+    }
+
     if (action != "save") {
       return;
     }
@@ -493,6 +510,7 @@ int ClipDeckCore::RunListener() {
   WriteListenerStatusFile(listener.Status(), save_controller.Status());
 
   auto next_status_write = std::chrono::steady_clock::now();
+  bool choose_capture_wait_logged = false;
 
   while (listener.IsRunning() && shutdown_requested == 0) {
     if (save_requested != 0) {
@@ -507,9 +525,40 @@ int ClipDeckCore::RunListener() {
       }
     }
 
+    if (choose_capture_requested != 0) {
+      const auto save_status = save_controller.Status();
+      if (save_status.saving) {
+        if (!choose_capture_wait_logged) {
+          Log(LogLevel::Info, kCoreContext,
+              "Capture reselection requested; waiting for the active save to finish.");
+          choose_capture_wait_logged = true;
+        }
+      } else {
+        choose_capture_requested = 0;
+        choose_capture_wait_logged = false;
+        Log(LogLevel::Info, kCoreContext,
+            "Restarting recorder so the desktop portal can choose a new capture source.");
+        recorder->Stop();
+        recorder =
+            std::make_unique<GStreamerRecorder>(BuildRecorderConfig(settings_));
+        if (!recorder->Start()) {
+          Log(LogLevel::Warning, kCoreContext,
+              "Native recorder did not restart after capture reselection request.");
+        }
+        WriteRecorderStatusFile(recorder->Status());
+      }
+    }
+
     if (std::chrono::steady_clock::now() >= next_status_write) {
-      WriteRecorderStatusFile(recorder->Status());
+      const auto recorder_status = recorder->Status();
+      WriteRecorderStatusFile(recorder_status);
       WriteListenerStatusFile(listener.Status(), save_controller.Status());
+      if (recorder_status.capture_source_type == "window" &&
+          !recorder_status.running) {
+        Log(LogLevel::Info, kCoreContext,
+            "Selected window capture stream ended; stopping ClipDeck listener. Start ClipDeck again to choose a new window, or choose a display capture to keep recording independent of an app window.");
+        shutdown_requested = 1;
+      }
       next_status_write = std::chrono::steady_clock::now() +
                           std::chrono::seconds(1);
     }
@@ -663,6 +712,37 @@ bool ClipDeckCore::Save() {
   return false;
 }
 
+bool ClipDeckCore::ChooseCapture() {
+  Log(LogLevel::Info, kCoreContext, "Capture source reselection requested.");
+
+  const auto pid = ReadPidFile(PidFilePath());
+  if (!pid.has_value() || !IsProcessRunning(pid.value())) {
+    if (pid.has_value()) {
+      RemovePidFile(PidFilePath());
+      std::error_code status_error;
+      std::filesystem::remove(RecorderStatusPath(), status_error);
+      std::filesystem::remove(ListenerStatusPath(), status_error);
+    }
+
+    Log(LogLevel::Info, kCoreContext,
+        "ClipDeck listener is not running; starting it so the portal picker can open.");
+    Start();
+    return true;
+  }
+
+  if (kill(pid.value(), SIGUSR2) != 0) {
+    Log(LogLevel::Error, kCoreContext,
+        "Failed to request capture reselection from daemon pid " +
+            std::to_string(pid.value()) + ".");
+    return false;
+  }
+
+  Log(LogLevel::Info, kCoreContext,
+      "Requested capture reselection from daemon pid " +
+          std::to_string(pid.value()) + ".");
+  return true;
+}
+
 void ClipDeckCore::Status() {
   const auto pid = ReadPidFile(PidFilePath());
   const bool running = pid.has_value() && IsProcessRunning(pid.value());
@@ -728,6 +808,7 @@ void ClipDeckCore::ShowSettings() const {
       "Buffer safety: " + std::to_string(settings_.buffer_safety_seconds) +
           " seconds.");
   Log(LogLevel::Info, kCoreContext, "Save keybind: " + settings_.save_keybind + ".");
+  Log(LogLevel::Info, kCoreContext, "Stop keybind: " + settings_.stop_keybind + ".");
   Log(LogLevel::Info, kCoreContext,
       "Clip directory: " + settings_.clip_directory.string() + ".");
   Log(LogLevel::Info, kCoreContext,
@@ -797,6 +878,15 @@ void ClipDeckCore::SetSaveKeybind(std::string save_keybind) {
   }
 }
 
+void ClipDeckCore::SetStopKeybind(std::string stop_keybind) {
+  settings_.stop_keybind = std::move(stop_keybind);
+
+  if (SaveSettings()) {
+    Log(LogLevel::Info, kCoreContext,
+        "Stop keybind set to " + settings_.stop_keybind + ".");
+  }
+}
+
 void ClipDeckCore::SetBufferSafety(int seconds) {
   settings_.buffer_safety_seconds = seconds;
 
@@ -809,7 +899,7 @@ void ClipDeckCore::SetBufferSafety(int seconds) {
 void ClipDeckCore::SetCaptureVideoSource(std::string source) {
   if (source != "portal") {
     Log(LogLevel::Error, kCoreContext,
-        "Native video capture is screen-only. Use 'portal' so the desktop portal can capture a monitor/window without camera input.");
+        "Native video capture uses the XDG portal picker. Use: portal.");
     return;
   }
 
@@ -921,7 +1011,8 @@ bool ClipDeckCore::IsRunning() const {
 }
 
 ListenerConfig ClipDeckCore::BuildListenerConfig() const {
-  return ListenerConfig{settings_.save_keybind};
+  return ListenerConfig{.save_keybind = settings_.save_keybind,
+                        .stop_keybind = settings_.stop_keybind};
 }
 
 bool ClipDeckCore::SaveSettings() const {

@@ -12,6 +12,7 @@ struct ClipDeckSettings {
   int clip_length_seconds = 30;
   int buffer_safety_seconds = 5;
   std::string save_keybind = "Ctrl+Z+P";
+  std::string stop_keybind = "Ctrl+Z+O";
   std::filesystem::path clip_directory = "output/clips";
   std::string capture_video_source = "portal";
   bool capture_audio_enabled = true;

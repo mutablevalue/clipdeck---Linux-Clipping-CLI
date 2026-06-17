@@ -139,6 +139,18 @@ int CommandHandler::Run(int argc, char *argv[]) {
     return clipdeck.Save() ? 0 : 1;
   }
 
+  if (command == "choose-capture") {
+    if (HasExtraArguments(argc, 2)) {
+      Log(LogLevel::Error, kCommandContext,
+          "The choose-capture command does not accept extra arguments.");
+      PrintHelp();
+      return 1;
+    }
+
+    ClipDeckCore clipdeck;
+    return clipdeck.ChooseCapture() ? 0 : 1;
+  }
+
   if (command == "status") {
     if (HasExtraArguments(argc, 2)) {
       Log(LogLevel::Error, kCommandContext,
@@ -190,7 +202,7 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
 
   if (setting == "keybind") {
     if (argc == 3) {
-      return SetKeybindFromCapture();
+      return SetKeybindFromCapture("save");
     }
 
     if (argc == 4) {
@@ -207,6 +219,28 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
 
     Log(LogLevel::Error, kCommandContext,
         "Usage: clipdeck settings keybind");
+    return 1;
+  }
+
+  if (setting == "stop-keybind") {
+    if (argc == 3) {
+      return SetKeybindFromCapture("stop");
+    }
+
+    if (argc == 4) {
+      const std::string normalized_keybind = NormalizeKeybind(argv[3]);
+      if (!ParseKeybindRequirements(normalized_keybind).has_value()) {
+        Log(LogLevel::Error, kCommandContext,
+            "Unsupported keybind. Use letters with Ctrl, Alt, or Shift.");
+        return 1;
+      }
+
+      clipdeck.SetStopKeybind(normalized_keybind);
+      return 0;
+    }
+
+    Log(LogLevel::Error, kCommandContext,
+        "Usage: clipdeck settings stop-keybind [combo]");
     return 1;
   }
 
@@ -264,9 +298,10 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
       return 1;
     }
 
-    if (std::string_view(argv[3]) != "portal") {
+    const std::string_view source = argv[3];
+    if (source != "portal") {
       Log(LogLevel::Error, kCommandContext,
-          "Native video capture is screen-only. Use: clipdeck settings video-source portal");
+          "Native video capture uses the XDG portal picker. Use: clipdeck settings video-source portal");
       return 1;
     }
 
@@ -415,9 +450,10 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
   return 1;
 }
 
-int CommandHandler::SetKeybindFromCapture() const {
+int CommandHandler::SetKeybindFromCapture(std::string_view action) const {
   Log(LogLevel::Info, kCommandContext,
-      "Press the save keybind for terminal-only setup capture, for example Ctrl + Z + P.");
+      "Press the " + std::string(action) +
+          " keybind for terminal-only setup capture, for example Ctrl + Z + P.");
   Log(LogLevel::Info, kCommandContext,
       "For terminal capture, hold Ctrl and press Z, then press P, then press Enter.");
   Log(LogLevel::Info, kCommandContext,
@@ -438,7 +474,11 @@ int CommandHandler::SetKeybindFromCapture() const {
   }
 
   ClipDeckCore clipdeck;
-  clipdeck.SetSaveKeybind(captured_keybind.value());
+  if (action == "stop") {
+    clipdeck.SetStopKeybind(captured_keybind.value());
+  } else {
+    clipdeck.SetSaveKeybind(captured_keybind.value());
+  }
   return 0;
 }
 
@@ -454,6 +494,8 @@ void CommandHandler::PrintHelp() const {
   Log(LogLevel::Info, kCommandContext,
       "  save                          Request a clip save");
   Log(LogLevel::Info, kCommandContext,
+      "  choose-capture                Reopen the desktop portal capture picker");
+  Log(LogLevel::Info, kCommandContext,
       "  status                        Show runtime status and settings");
   Log(LogLevel::Info, kCommandContext,
       "  setup                         Validate and save native capture sources");
@@ -466,13 +508,17 @@ void CommandHandler::PrintHelp() const {
   Log(LogLevel::Info, kCommandContext,
       "  settings keybind <combo>      Save a keybind directly, like Ctrl+Z+P");
   Log(LogLevel::Info, kCommandContext,
+      "  settings stop-keybind         Capture and save the stop keybind");
+  Log(LogLevel::Info, kCommandContext,
+      "  settings stop-keybind <combo> Save the stop keybind directly");
+  Log(LogLevel::Info, kCommandContext,
       "  settings length <seconds>     Set the clip length");
   Log(LogLevel::Info, kCommandContext,
       "  settings buffer-safety <sec>  Set extra recorder buffer duration");
   Log(LogLevel::Info, kCommandContext,
       "  settings output <directory>   Set the clip save directory");
   Log(LogLevel::Info, kCommandContext,
-      "  settings video-source portal  Use screen capture through desktop portal");
+      "  settings video-source portal  Use the desktop portal picker");
   Log(LogLevel::Info, kCommandContext,
       "  settings audio <on|off|auto>  Enable, disable, or auto-select output audio");
   Log(LogLevel::Info, kCommandContext,

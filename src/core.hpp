@@ -17,6 +17,7 @@ public:
   void Stop();
   void Restart();
   bool Save();
+  bool ChooseCapture();
   void Status();
   bool Setup();
   bool Diagnose();
@@ -24,6 +25,7 @@ public:
   void SetClipLength(int seconds);
   void SetClipDirectory(const std::filesystem::path &clip_directory);
   void SetSaveKeybind(std::string save_keybind);
+  void SetStopKeybind(std::string stop_keybind);
   void SetBufferSafety(int seconds);
   void SetCaptureVideoSource(std::string source);
   void SetCaptureAudioEnabled(bool enabled);
