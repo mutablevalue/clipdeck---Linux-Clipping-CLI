@@ -35,6 +35,7 @@ public:
   void SetCaptureFps(int fps);
   void SetVideoBitrate(int bitrate_kbps);
   void SetAudioBitrate(int bitrate_kbps);
+  void SetMaxClipSize(int size_mb);
   void SetEncoder(std::string encoder);
   [[nodiscard]] bool IsRunning() const;
 

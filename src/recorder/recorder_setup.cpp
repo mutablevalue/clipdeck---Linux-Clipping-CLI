@@ -43,9 +43,8 @@ std::optional<std::string> CaptureCommandOutput(const std::string &command) {
     output += buffer.data();
   }
 
-  while (!output.empty() &&
-         (output.back() == '\n' || output.back() == '\r' ||
-          output.back() == ' ' || output.back() == '\t')) {
+  while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
+                             output.back() == ' ' || output.back() == '\t')) {
     output.pop_back();
   }
 
@@ -57,7 +56,8 @@ std::optional<std::string> CaptureCommandOutput(const std::string &command) {
 }
 
 std::optional<std::string> DefaultSinkMonitor() {
-  const auto default_sink = CaptureCommandOutput("pactl get-default-sink 2>/dev/null");
+  const auto default_sink =
+      CaptureCommandOutput("pactl get-default-sink 2>/dev/null");
   if (!default_sink.has_value()) {
     return std::nullopt;
   }
@@ -73,15 +73,29 @@ bool UsesAutomaticAudioSource(std::string_view source) {
 std::vector<std::string>
 RequiredElements(const clipdeck::ClipDeckSettings &settings) {
   std::vector<std::string> elements{"pipewiresrc", "videoconvert", "videoscale",
-                                    "h264parse", "mp4mux", "splitmuxsink"};
+                                    "videorate",   "h264parse",    "mp4mux",
+                                    "splitmuxsink"};
 
-  elements.push_back(settings.encoder == "x264" ? "x264enc" : "openh264enc");
+  if (settings.encoder == "auto") {
+    GstElementFactory *factory = gst_element_factory_find("x264enc");
+    elements.push_back(factory != nullptr ? "x264enc" : "openh264enc");
+    if (factory != nullptr) {
+      gst_object_unref(factory);
+    }
+  } else {
+    elements.push_back(settings.encoder == "x264" ? "x264enc" : "openh264enc");
+  }
 
   if (settings.capture_audio_enabled) {
     elements.emplace_back("pulsesrc");
     elements.emplace_back("audioconvert");
     elements.emplace_back("audioresample");
-    elements.emplace_back("avenc_aac");
+    elements.emplace_back("audiorate");
+    GstElementFactory *fdk_factory = gst_element_factory_find("fdkaacenc");
+    elements.emplace_back(fdk_factory != nullptr ? "fdkaacenc" : "avenc_aac");
+    if (fdk_factory != nullptr) {
+      gst_object_unref(fdk_factory);
+    }
     elements.emplace_back("aacparse");
   }
 
@@ -138,7 +152,8 @@ bool ValidateFfmpeg() {
   }
 
   Log(LogLevel::Error, kSetupContext,
-      "Missing ffmpeg. Install ffmpeg so ClipDeck can compose retained recorder segments into MP4 clips.");
+      "Missing ffmpeg. Install ffmpeg so ClipDeck can compose retained "
+      "recorder segments into MP4 clips.");
   return false;
 }
 
@@ -165,9 +180,8 @@ std::vector<AudioCaptureSource> ParseAudioCaptureSources(
     capture_sources.push_back(AudioCaptureSource{
         .name = source,
         .monitor = source.ends_with(".monitor"),
-        .default_output_monitor =
-            default_output_monitor.has_value() &&
-            source == default_output_monitor.value()});
+        .default_output_monitor = default_output_monitor.has_value() &&
+                                  source == default_output_monitor.value()});
   }
 
   return capture_sources;
@@ -191,7 +205,8 @@ SelectAutomaticAudioMonitor(const std::vector<AudioCaptureSource> &sources) {
 }
 
 std::vector<AudioCaptureSource> AvailableAudioCaptureSources() {
-  const auto output = CaptureCommandOutput("pactl list short sources 2>/dev/null");
+  const auto output =
+      CaptureCommandOutput("pactl list short sources 2>/dev/null");
   if (!output.has_value()) {
     return {};
   }
@@ -236,22 +251,27 @@ bool SetupNativeRecorder(ClipDeckSettings &settings) {
     Log(LogLevel::Info, kSetupContext, "Audio capture: disabled.");
   } else if (!audio_source.has_value()) {
     Log(LogLevel::Error, kSetupContext,
-        "No desktop audio monitor source was detected. Use 'clipdeck settings audio off' for video-only clips, or set a monitor source with 'clipdeck settings audio-source <source>'.");
+        "No desktop audio monitor source was detected. Use 'clipdeck settings "
+        "audio off' for video-only clips, or set a monitor source with "
+        "'clipdeck settings audio-source <source>'.");
     return false;
   } else {
     Log(LogLevel::Info, kSetupContext,
         "Audio source: " + audio_source.value() + ".");
   }
 
-  const bool plugins_ok = ValidateGStreamerPlugins(settings) && ValidateFfmpeg();
+  const bool plugins_ok =
+      ValidateGStreamerPlugins(settings) && ValidateFfmpeg();
   if (!plugins_ok) {
     Log(LogLevel::Error, kSetupContext,
-        "Install the missing GStreamer/PipeWire runtime plugins and rerun clipdeck setup.");
+        "Install the missing GStreamer/PipeWire runtime plugins and rerun "
+        "clipdeck setup.");
     return false;
   }
 
   Log(LogLevel::Info, kSetupContext,
-      "Native recorder setup completed. Portal permission may still be requested when capture starts.");
+      "Native recorder setup completed. Portal permission may still be "
+      "requested when capture starts.");
   return true;
 }
 
@@ -277,7 +297,8 @@ bool DiagnoseNativeRecorder(const ClipDeckSettings &settings) {
 
   if (settings.capture_audio_enabled && !audio_source.has_value()) {
     Log(LogLevel::Error, kSetupContext,
-        "Audio capture is enabled but no PulseAudio/PipeWire monitor source is available.");
+        "Audio capture is enabled but no PulseAudio/PipeWire monitor source is "
+        "available.");
     ok = false;
   }
 

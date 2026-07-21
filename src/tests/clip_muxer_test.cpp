@@ -146,10 +146,9 @@ std::filesystem::path CreateTestSegment(const std::filesystem::path &directory,
   const auto video_arguments = TestVideoEncoderArguments();
   arguments.insert(arguments.end(), video_arguments.begin(),
                    video_arguments.end());
-  arguments.insert(arguments.end(),
-                   {"-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
-                    "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
-                    path.string()});
+  arguments.insert(arguments.end(), {"-pix_fmt", "yuv420p", "-c:a", "aac",
+                                     "-b:a", "96k", "-ar", "48000", "-ac", "2",
+                                     "-movflags", "+faststart", path.string()});
   const int exit_code = RunFfmpeg(std::move(arguments));
 
   EXPECT_EQ(exit_code, 0);
@@ -184,10 +183,9 @@ std::filesystem::path CreateBlackSegment(const std::filesystem::path &directory,
   const auto video_arguments = TestVideoEncoderArguments();
   arguments.insert(arguments.end(), video_arguments.begin(),
                    video_arguments.end());
-  arguments.insert(arguments.end(),
-                   {"-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
-                    "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
-                    path.string()});
+  arguments.insert(arguments.end(), {"-pix_fmt", "yuv420p", "-c:a", "aac",
+                                     "-b:a", "96k", "-ar", "48000", "-ac", "2",
+                                     "-movflags", "+faststart", path.string()});
   const int exit_code = RunFfmpeg(std::move(arguments));
 
   EXPECT_EQ(exit_code, 0);
@@ -200,11 +198,29 @@ CreateAudioOnlySegment(const std::filesystem::path &directory,
   const auto path = directory / (std::string(name) + ".mp4");
   const std::string duration = std::to_string(duration_seconds);
   std::vector<std::string> arguments{
-      "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-      "-f", "lavfi", "-i",
+      "ffmpeg",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
       "sine=frequency=440:sample_rate=48000:duration=" + duration,
-      "-t", duration, "-map", "0:a:0", "-c:a", "aac", "-b:a", "96k",
-      "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
+      "-t",
+      duration,
+      "-map",
+      "0:a:0",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "96k",
+      "-ar",
+      "48000",
+      "-ac",
+      "2",
+      "-movflags",
+      "+faststart",
       path.string()};
   const int exit_code = RunFfmpeg(std::move(arguments));
 
@@ -219,7 +235,12 @@ clipdeck::ClipMuxerOptions TestOptions(std::chrono::seconds target_duration) {
                                     .fps = 10,
                                     .video_bitrate_kbps = 500,
                                     .audio_bitrate_kbps = 96,
-                                    .audio_enabled = true};
+                                    .audio_enabled = true,
+                                    .trust_recorder_segments = false,
+                                    .available_duration_seconds = std::nullopt,
+                                    .end_trim_seconds = 0.0,
+                                    .max_output_bytes = std::nullopt,
+                                    .validate_black_frames = true};
 }
 
 void ExpectValidClip(const std::filesystem::path &path,
@@ -357,13 +378,37 @@ TEST(ClipMuxerTest, PublishesTargetDurationWhenEnoughCaptureExists) {
 
   const auto first_segment = CreateTestSegment(segments, "first", 15.0);
   const auto second_segment = CreateTestSegment(segments, "second", 15.0);
-  const auto options = TestOptions(std::chrono::seconds(30));
+  auto options = TestOptions(std::chrono::seconds(30));
+  options.max_output_bytes = 11000000;
   clipdeck::ClipMuxer muxer(clips, temp);
   const auto clip =
       muxer.WriteClipFromSegments({first_segment, second_segment}, options);
 
   ASSERT_TRUE(clip.has_value());
   ExpectValidClip(clip.value(), options, 30.0);
+  EXPECT_LE(std::filesystem::file_size(clip.value()), 11000000U);
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
+TEST(ClipMuxerTest, TrimsFootageAfterRequestBoundary) {
+  const auto root = TestDirectory("muxer-end-trim");
+  const auto clips = root / "clips";
+  const auto temp = root / "runtime";
+  const auto segments = root / "segments";
+  std::filesystem::create_directories(clips);
+  std::filesystem::create_directories(temp);
+  std::filesystem::create_directories(segments);
+
+  const auto segment = CreateTestSegment(segments, "boundary", 3.0);
+  auto options = TestOptions(std::chrono::seconds(30));
+  options.end_trim_seconds = 1.0;
+  clipdeck::ClipMuxer muxer(clips, temp);
+  const auto clip = muxer.WriteClipFromSegments({segment}, options);
+
+  ASSERT_TRUE(clip.has_value());
+  ExpectValidClip(clip.value(), options, 2.0);
 
   std::error_code error;
   std::filesystem::remove_all(root, error);
@@ -425,7 +470,8 @@ TEST(ClipMuxerTest, SkipsSegmentWithoutVideo) {
   std::filesystem::create_directories(temp);
   std::filesystem::create_directories(segments);
 
-  const auto audio_only_segment = CreateAudioOnlySegment(segments, "audio", 2.0);
+  const auto audio_only_segment =
+      CreateAudioOnlySegment(segments, "audio", 2.0);
   const auto real_segment = CreateTestSegment(segments, "real", 2.0);
   const auto options = TestOptions(std::chrono::seconds(5));
   clipdeck::ClipMuxer muxer(clips, temp);

@@ -1,6 +1,7 @@
 #include "../settings/settings_store.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 
 namespace {
@@ -30,9 +31,10 @@ TEST(SettingsStoreTest, LoadsDefaultsWhenFileDoesNotExist) {
   EXPECT_EQ(settings.capture_width, 1920);
   EXPECT_EQ(settings.capture_height, 1080);
   EXPECT_EQ(settings.capture_fps, 60);
-  EXPECT_EQ(settings.video_bitrate_kbps, 12000);
-  EXPECT_EQ(settings.audio_bitrate_kbps, 192);
-  EXPECT_EQ(settings.encoder, "openh264");
+  EXPECT_EQ(settings.video_bitrate_kbps, 2500);
+  EXPECT_EQ(settings.audio_bitrate_kbps, 128);
+  EXPECT_EQ(settings.max_clip_size_mb, 11);
+  EXPECT_EQ(settings.encoder, "auto");
   EXPECT_TRUE(settings.feedback_sound_enabled);
   EXPECT_TRUE(settings.feedback_sound_path.empty());
   EXPECT_DOUBLE_EQ(settings.feedback_sound_volume, 0.5);
@@ -56,6 +58,7 @@ TEST(SettingsStoreTest, SavesAndLoadsSettings) {
   saved_settings.capture_fps = 30;
   saved_settings.video_bitrate_kbps = 8000;
   saved_settings.audio_bitrate_kbps = 160;
+  saved_settings.max_clip_size_mb = 25;
   saved_settings.encoder = "x264";
   saved_settings.feedback_sound_enabled = false;
   saved_settings.feedback_sound_path = "/tmp/clipdeck-sound.wav";
@@ -72,15 +75,35 @@ TEST(SettingsStoreTest, SavesAndLoadsSettings) {
   EXPECT_EQ(loaded_settings.clip_directory, "/tmp/clipdeck-clips");
   EXPECT_EQ(loaded_settings.capture_video_source, "portal");
   EXPECT_FALSE(loaded_settings.capture_audio_enabled);
-  EXPECT_EQ(loaded_settings.capture_audio_source,
-            "alsa_output.test.monitor");
+  EXPECT_EQ(loaded_settings.capture_audio_source, "alsa_output.test.monitor");
   EXPECT_EQ(loaded_settings.capture_width, 1280);
   EXPECT_EQ(loaded_settings.capture_height, 720);
   EXPECT_EQ(loaded_settings.capture_fps, 30);
   EXPECT_EQ(loaded_settings.video_bitrate_kbps, 8000);
   EXPECT_EQ(loaded_settings.audio_bitrate_kbps, 160);
+  EXPECT_EQ(loaded_settings.max_clip_size_mb, 25);
   EXPECT_EQ(loaded_settings.encoder, "x264");
   EXPECT_FALSE(loaded_settings.feedback_sound_enabled);
   EXPECT_EQ(loaded_settings.feedback_sound_path, "/tmp/clipdeck-sound.wav");
   EXPECT_DOUBLE_EQ(loaded_settings.feedback_sound_volume, 0.25);
+}
+
+TEST(SettingsStoreTest, MigratesFormerUntouchedEncodingDefaults) {
+  const auto settings_path = TestSettingsPath();
+  {
+    std::ofstream output(settings_path, std::ios::trunc);
+    output << "video_bitrate_kbps=12000\n"
+           << "audio_bitrate_kbps=192\n"
+           << "encoder=openh264\n";
+  }
+
+  const clipdeck::SettingsStore store(settings_path);
+  const auto settings = store.Load();
+
+  EXPECT_EQ(settings.settings_version, 2);
+  EXPECT_EQ(settings.video_bitrate_kbps, 2500);
+  EXPECT_EQ(settings.audio_bitrate_kbps, 128);
+  EXPECT_EQ(settings.encoder, "auto");
+
+  std::filesystem::remove(settings_path);
 }

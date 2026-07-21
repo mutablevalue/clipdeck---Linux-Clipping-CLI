@@ -5,8 +5,8 @@
 #include "segment_file.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -19,8 +19,8 @@
 #if defined(CLIPDECK_HAS_GSTREAMER)
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
-#include <gst/gst.h>
 #include <glib-object.h>
+#include <gst/gst.h>
 #endif
 
 namespace {
@@ -36,11 +36,6 @@ struct RecorderSegmentSummary {
   std::optional<int> audio_sample_rate;
   std::optional<int> audio_channels;
 };
-
-std::size_t RetainedSegmentCount(const clipdeck::RecorderConfig &config) {
-  return static_cast<std::size_t>(config.clip_length_seconds +
-                                  config.buffer_safety_seconds + 3);
-}
 
 std::string GstQuote(std::string_view value) {
   std::string quoted = "\"";
@@ -97,11 +92,11 @@ std::string LiveRawVideoQueue(const clipdeck::RecorderConfig &config) {
 }
 
 std::string LiveEncodedVideoQueue(const clipdeck::RecorderConfig &config) {
-  return std::format("queue max-size-buffers=0 max-size-bytes={} "
-                     "max-size-time=2000000000",
-                     EncodedQueueByteLimit(config.video_bitrate_kbps,
-                                           std::chrono::seconds(2),
-                                           4 * 1024 * 1024));
+  return std::format(
+      "queue max-size-buffers=0 max-size-bytes={} "
+      "max-size-time=2000000000",
+      EncodedQueueByteLimit(clipdeck::EffectiveVideoBitrateKbps(config),
+                            std::chrono::seconds(2), 4 * 1024 * 1024));
 }
 
 std::string LiveRawAudioQueue() {
@@ -229,13 +224,15 @@ std::string PortalRequestPath(GDBusConnection *connection,
          PortalSenderPathPart(connection) + "/" + request_token;
 }
 
-void ClosePortalSession(GDBusConnection *connection, std::string_view session_handle);
+void ClosePortalSession(GDBusConnection *connection,
+                        std::string_view session_handle);
 
 std::optional<GVariant *> WaitForPortalResponse(GDBusConnection *connection,
                                                 guint subscription,
                                                 PortalResponseState &state,
                                                 std::string_view action) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::minutes(2);
   while (!state.done && std::chrono::steady_clock::now() < deadline) {
     g_main_context_iteration(nullptr, FALSE);
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -275,10 +272,9 @@ std::optional<GVariant *> CallPortalRequest(GDBusConnection *connection,
   GError *error = nullptr;
   GVariant *result = g_dbus_connection_call_sync(
       connection, "org.freedesktop.portal.Desktop",
-      "/org/freedesktop/portal/desktop",
-      "org.freedesktop.portal.ScreenCast", std::string(method).c_str(),
-      parameters, G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, nullptr,
-      &error);
+      "/org/freedesktop/portal/desktop", "org.freedesktop.portal.ScreenCast",
+      std::string(method).c_str(), parameters, G_VARIANT_TYPE("(o)"),
+      G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &error);
 
   if (result == nullptr) {
     g_dbus_connection_signal_unsubscribe(connection, subscription);
@@ -350,7 +346,8 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
     const auto derived_session_handle =
         PortalSessionPath(connection, session_token);
     Log(LogLevel::Error, kRecorderContext,
-        "Portal CreateSession response did not include a session handle; using derived handle " +
+        "Portal CreateSession response did not include a session handle; using "
+        "derived handle " +
             derived_session_handle + ".");
     session_handle = g_strdup(derived_session_handle.c_str());
   }
@@ -399,9 +396,8 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
   std::uint32_t node_id = 0;
   std::optional<std::uint32_t> source_type;
   std::optional<std::uint64_t> pipewire_serial;
-  GVariant *streams =
-      g_variant_lookup_value(start_results.value(), "streams",
-                             G_VARIANT_TYPE("a(ua{sv})"));
+  GVariant *streams = g_variant_lookup_value(start_results.value(), "streams",
+                                             G_VARIANT_TYPE("a(ua{sv})"));
   if (streams != nullptr && g_variant_n_children(streams) > 0) {
     GVariant *stream = g_variant_get_child_value(streams, 0);
     GVariant *properties = nullptr;
@@ -434,9 +430,9 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
     ClosePortalSession(connection, owned_session_handle);
     g_free(session_handle);
     g_object_unref(connection);
-    const std::string returned_type =
-        source_type.has_value() ? std::to_string(source_type.value())
-                                : std::string("<missing>");
+    const std::string returned_type = source_type.has_value()
+                                          ? std::to_string(source_type.value())
+                                          : std::string("<missing>");
     Log(LogLevel::Error, kRecorderContext,
         "Portal returned screen cast source type " + returned_type +
             ", which is not a monitor or window source.");
@@ -454,7 +450,8 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
 
   if (!pipewire_serial.has_value()) {
     Log(LogLevel::Warning, kRecorderContext,
-        "Portal Start response did not include a PipeWire stream serial; falling back to the selected monitor node path " +
+        "Portal Start response did not include a PipeWire stream serial; "
+        "falling back to the selected monitor node path " +
             std::to_string(node_id) + " on the portal PipeWire remote.");
   }
 
@@ -463,8 +460,8 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
   GUnixFDList *fd_list = nullptr;
   GVariant *open_result = g_dbus_connection_call_with_unix_fd_list_sync(
       connection, "org.freedesktop.portal.Desktop",
-      "/org/freedesktop/portal/desktop",
-      "org.freedesktop.portal.ScreenCast", "OpenPipeWireRemote",
+      "/org/freedesktop/portal/desktop", "org.freedesktop.portal.ScreenCast",
+      "OpenPipeWireRemote",
       g_variant_new("(oa{sv})", session_handle, &open_options),
       G_VARIANT_TYPE("(h)"), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &fd_list,
       nullptr, &error);
@@ -516,8 +513,8 @@ std::optional<PortalSession> OpenPortalScreenCastSession() {
                        .source_type = source_type.value(),
                        .target_object =
                            pipewire_serial.has_value()
-                               ? std::optional<std::string>{
-                                     std::to_string(pipewire_serial.value())}
+                               ? std::optional<std::string>{std::to_string(
+                                     pipewire_serial.value())}
                                : std::nullopt,
                        .session_handle = owned_session_handle};
 }
@@ -572,10 +569,9 @@ std::string PopStartupError(GstBus *bus) {
     return "GStreamer pipeline failed to enter PLAYING state.";
   }
 
-  GstMessage *message =
-      gst_bus_timed_pop_filtered(bus, 2 * GST_SECOND,
-                                 static_cast<GstMessageType>(GST_MESSAGE_ERROR |
-                                                             GST_MESSAGE_WARNING));
+  GstMessage *message = gst_bus_timed_pop_filtered(
+      bus, 2 * GST_SECOND,
+      static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING));
   if (message == nullptr) {
     return "GStreamer pipeline failed to enter PLAYING state.";
   }
@@ -634,11 +630,15 @@ bool GStreamerRecorder::Start() {
 #else
   EnsureGStreamerInitialized();
   CleanSegmentDirectory();
+  {
+    std::scoped_lock lock(fragment_mutex_);
+    fragments_.clear();
+    open_fragments_.clear();
+    request_cutoffs_.clear();
+  }
 
   if (!IsSupportedVideoSource(config_.video_source)) {
-    SetMessage(
-        "Native recorder supports the portal video source.",
-        false);
+    SetMessage("Native recorder supports the portal video source.", false);
     Log(LogLevel::Error, kRecorderContext, message_);
     return false;
   }
@@ -659,8 +659,8 @@ bool GStreamerRecorder::Start() {
   Log(LogLevel::Info, kRecorderContext,
       portal_target_object_.has_value()
           ? "Using portal PipeWire serial target " +
-                portal_target_object_.value() + " for " +
-                capture_source_type_ + " capture."
+                portal_target_object_.value() + " for " + capture_source_type_ +
+                " capture."
           : "Using portal PipeWire node path " +
                 std::to_string(portal_node_id_) + " on the portal remote for " +
                 capture_source_type_ + " capture.");
@@ -766,13 +766,13 @@ bool GStreamerRecorder::Start() {
   bus_ = bus;
   running_ = true;
   SetMessage("recording", true);
-  bus_thread_ =
-      std::jthread([this](std::stop_token stop_token) { MonitorBus(stop_token); });
+  bus_thread_ = std::jthread(
+      [this](std::stop_token stop_token) { MonitorBus(stop_token); });
 
   Log(LogLevel::Info, kRecorderContext,
       std::format("Started native recorder at {}x{}@{}fps, {} kbps video.",
                   config_.width, config_.height, config_.fps,
-                  config_.video_bitrate_kbps));
+                  EffectiveVideoBitrateKbps(config_)));
   return true;
 #endif
 }
@@ -833,7 +833,38 @@ void GStreamerRecorder::Stop() {
 }
 
 bool GStreamerRecorder::SaveClip() {
+  static std::atomic_uint64_t next_direct_request_id{1ULL << 63};
+  const SaveRequest request{.id = next_direct_request_id++,
+                            .source = SaveSource::Manual,
+                            .requested_at = std::chrono::steady_clock::now()};
+  MarkClipBoundary(request);
+  return SaveClip(request);
+}
+
+void GStreamerRecorder::MarkClipBoundary(const SaveRequest &request) {
+#if defined(CLIPDECK_HAS_GSTREAMER)
+  const auto running_time = PipelineRunningTimeNs();
+  if (!running_time.has_value()) {
+    return;
+  }
+
+  {
+    std::scoped_lock lock(fragment_mutex_);
+    request_cutoffs_[request.id] = running_time.value();
+  }
+  SplitAtRunningTime(running_time.value());
+#else
+  (void)request;
+#endif
+}
+
+bool GStreamerRecorder::SaveClip(const SaveRequest &request) {
   std::scoped_lock save_lock(save_mutex_);
+
+  const auto release_request = [this, request_id = request.id] {
+    std::scoped_lock lock(fragment_mutex_);
+    request_cutoffs_.erase(request_id);
+  };
 
   {
     std::scoped_lock lock(state_mutex_);
@@ -853,24 +884,81 @@ bool GStreamerRecorder::SaveClip() {
         "Native recorder is not healthy: " + unhealthy_message);
     {
       std::scoped_lock lock(state_mutex_);
-      last_save_failure_ = "Native recorder is not healthy: " + unhealthy_message;
+      last_save_failure_ =
+          "Native recorder is not healthy: " + unhealthy_message;
     }
+    release_request();
     return false;
   }
 
-  SplitCurrentSegment();
-  if (!WaitForAnyFinalizedSegment(std::chrono::seconds(2))) {
+  std::vector<std::filesystem::path> segments;
+  double selected_duration_seconds = 0.0;
+  double end_trim_seconds = 0.0;
+  {
+    std::unique_lock lock(fragment_mutex_);
+    const auto cutoff_entry = request_cutoffs_.find(request.id);
+    if (cutoff_entry != request_cutoffs_.end()) {
+      const std::uint64_t cutoff = cutoff_entry->second;
+      fragment_condition_.wait_for(lock, std::chrono::seconds(3), [&] {
+        return !running_ ||
+               std::ranges::any_of(fragments_, [cutoff](const auto &fragment) {
+                 return fragment.end_running_time_ns >= cutoff;
+               });
+      });
+
+      constexpr std::uint64_t kNanosecondsPerSecond = 1000000000ULL;
+      const std::uint64_t target_ns =
+          static_cast<std::uint64_t>(std::max(config_.clip_length_seconds, 1)) *
+          kNanosecondsPerSecond;
+      const std::uint64_t window_start =
+          cutoff > target_ns ? cutoff - target_ns : 0;
+      std::optional<std::uint64_t> first_start;
+      std::optional<std::uint64_t> last_end;
+      for (const auto &fragment : fragments_) {
+        if (fragment.end_running_time_ns <= window_start ||
+            fragment.start_running_time_ns >= cutoff ||
+            !std::filesystem::exists(fragment.path)) {
+          continue;
+        }
+        segments.push_back(fragment.path);
+        first_start =
+            first_start.has_value()
+                ? std::min(first_start.value(), fragment.start_running_time_ns)
+                : fragment.start_running_time_ns;
+        last_end = last_end.has_value() ? std::max(last_end.value(),
+                                                   fragment.end_running_time_ns)
+                                        : fragment.end_running_time_ns;
+      }
+      if (first_start.has_value() && last_end.has_value()) {
+        selected_duration_seconds =
+            static_cast<double>(last_end.value() - first_start.value()) /
+            static_cast<double>(kNanosecondsPerSecond);
+        end_trim_seconds = static_cast<double>(last_end.value() - cutoff) /
+                           static_cast<double>(kNanosecondsPerSecond);
+      }
+    }
+  }
+
+  if (segments.empty()) {
+    SplitCurrentSegment();
+  }
+  if (segments.empty() &&
+      !WaitForAnyFinalizedSegment(std::chrono::seconds(2))) {
     Log(LogLevel::Warning, kRecorderContext,
         "Recorder has not produced a finalized segment yet.");
     {
       std::scoped_lock lock(state_mutex_);
-      last_save_failure_ =
-          "Recorder has not produced a finalized segment yet.";
+      last_save_failure_ = "Recorder has not produced a finalized segment yet.";
     }
+    release_request();
     return false;
   }
 
-  const auto segments = SelectSegmentsForClip();
+  if (segments.empty()) {
+    segments = SelectSegmentsForClip();
+    selected_duration_seconds =
+        static_cast<double>(segments.size() * kSegmentSeconds);
+  }
   if (segments.empty()) {
     Log(LogLevel::Warning, kRecorderContext,
         "Recorder has no usable finalized segments for saving.");
@@ -879,27 +967,28 @@ bool GStreamerRecorder::SaveClip() {
       last_save_failure_ =
           "Recorder has no usable finalized segments for saving.";
     }
+    release_request();
     return false;
   }
 
-  const double selected_duration_seconds =
-      static_cast<double>(segments.size() * kSegmentSeconds);
+  const int effective_video_bitrate = EffectiveVideoBitrateKbps(config_);
   const auto clip_path = muxer_.WriteClipFromSegments(
-      segments, ClipMuxerOptions{.target_duration =
-                                     std::chrono::seconds(
-                                         config_.clip_length_seconds),
-                                 .width = config_.width,
-                                 .height = config_.height,
-                                 .fps = config_.fps,
-                                 .video_bitrate_kbps =
-                                     config_.video_bitrate_kbps,
-                                 .audio_bitrate_kbps =
-                                     config_.audio_bitrate_kbps,
-                                 .audio_enabled = config_.audio_enabled,
-                                 .trust_recorder_segments = true,
-                                 .available_duration_seconds =
-                                     selected_duration_seconds,
-                                 .validate_black_frames = false});
+      segments,
+      ClipMuxerOptions{
+          .target_duration = std::chrono::seconds(config_.clip_length_seconds),
+          .width = config_.width,
+          .height = config_.height,
+          .fps = config_.fps,
+          .video_bitrate_kbps = effective_video_bitrate,
+          .audio_bitrate_kbps = config_.audio_bitrate_kbps,
+          .audio_enabled = config_.audio_enabled,
+          .trust_recorder_segments = true,
+          .available_duration_seconds = selected_duration_seconds,
+          .end_trim_seconds = end_trim_seconds,
+          .max_output_bytes =
+              static_cast<std::uintmax_t>(config_.max_clip_size_mb) *
+              1000000ULL,
+          .validate_black_frames = false});
 
   if (!clip_path.has_value()) {
     const std::string muxer_failure = muxer_.LastFailure();
@@ -914,6 +1003,7 @@ bool GStreamerRecorder::SaveClip() {
         last_capture_anomaly_ = muxer_failure;
       }
     }
+    release_request();
     return false;
   }
 
@@ -925,6 +1015,7 @@ bool GStreamerRecorder::SaveClip() {
     last_save_failure_.clear();
     last_saved_clip_ = clip_path.value();
   }
+  release_request();
   return true;
 }
 
@@ -948,30 +1039,28 @@ RecorderStatus GStreamerRecorder::Status() const {
   }
 
   const auto count = SegmentCount();
-  const auto segment_summary =
-      SegmentSummary(count, config_.audio_enabled);
-  return RecorderStatus{.running = running,
-                        .healthy = healthy,
-                        .backend = "native",
-                        .message = message,
-                        .capture_source_type = capture_source_type,
-                        .buffered_duration =
-                            std::chrono::seconds(count * kSegmentSeconds),
-                        .buffered_bytes = SegmentBytes(),
-                        .memory_budget_bytes = EstimateRecorderMemoryBudgetBytes(
-                            config_),
-                        .finalized_segment_count = segment_summary.count,
-                        .finalized_segment_duration = segment_summary.duration,
-                        .can_save_any_clip = segment_summary.count > 0,
-                        .can_save_full_clip_without_padding =
-                            segment_summary.duration >=
-                            std::chrono::seconds(config_.clip_length_seconds),
-                        .last_capture_anomaly = last_capture_anomaly,
-                        .last_save_failure = last_save_failure,
-                        .last_saved_clip = last_saved_clip,
-                        .audio_sample_rate = segment_summary.audio_sample_rate,
-                        .audio_channels = segment_summary.audio_channels,
-                        .audio_enabled = config_.audio_enabled};
+  const auto segment_summary = SegmentSummary(count, config_.audio_enabled);
+  return RecorderStatus{
+      .running = running,
+      .healthy = healthy,
+      .backend = "native",
+      .message = message,
+      .capture_source_type = capture_source_type,
+      .buffered_duration = std::chrono::seconds(count * kSegmentSeconds),
+      .buffered_bytes = SegmentBytes(),
+      .memory_budget_bytes = EstimateRecorderMemoryBudgetBytes(config_),
+      .finalized_segment_count = segment_summary.count,
+      .finalized_segment_duration = segment_summary.duration,
+      .can_save_any_clip = segment_summary.count > 0,
+      .can_save_full_clip_without_padding =
+          segment_summary.duration >=
+          std::chrono::seconds(config_.clip_length_seconds),
+      .last_capture_anomaly = last_capture_anomaly,
+      .last_save_failure = last_save_failure,
+      .last_saved_clip = last_saved_clip,
+      .audio_sample_rate = segment_summary.audio_sample_rate,
+      .audio_channels = segment_summary.audio_channels,
+      .audio_enabled = config_.audio_enabled};
 }
 
 #if defined(CLIPDECK_ENABLE_RECORDER_TEST_HOOKS)
@@ -1004,11 +1093,10 @@ void GStreamerRecorder::MonitorBus(std::stop_token stop_token) {
   auto *bus = static_cast<GstBus *>(bus_);
 
   while (running_ && !stop_token.stop_requested()) {
-    GstMessage *message =
-        gst_bus_timed_pop_filtered(bus, 250 * GST_MSECOND,
-                                   static_cast<GstMessageType>(GST_MESSAGE_ERROR |
-                                                               GST_MESSAGE_EOS |
-                                                               GST_MESSAGE_WARNING));
+    GstMessage *message = gst_bus_timed_pop_filtered(
+        bus, 250 * GST_MSECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS |
+                                    GST_MESSAGE_WARNING | GST_MESSAGE_ELEMENT));
 
     if (message == nullptr) {
       continue;
@@ -1055,6 +1143,10 @@ void GStreamerRecorder::MonitorBus(std::stop_token stop_token) {
       running_ = false;
     }
 
+    if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ELEMENT) {
+      RecordFragmentMessage(message);
+    }
+
     gst_message_unref(message);
   }
 #else
@@ -1080,9 +1172,122 @@ void GStreamerRecorder::SplitCurrentSegment() const {
     return;
   }
 
-  g_signal_emit_by_name(static_cast<GstElement *>(splitmux_sink_), "split-now",
-                        nullptr);
+  g_signal_emit_by_name(static_cast<GstElement *>(splitmux_sink_), "split-now");
 #endif
+}
+
+void GStreamerRecorder::SplitAtRunningTime(
+    std::uint64_t running_time_ns) const {
+#if defined(CLIPDECK_HAS_GSTREAMER)
+  if (splitmux_sink_ == nullptr) {
+    return;
+  }
+
+  g_signal_emit_by_name(static_cast<GstElement *>(splitmux_sink_),
+                        "split-at-running-time",
+                        static_cast<guint64>(running_time_ns));
+#else
+  (void)running_time_ns;
+#endif
+}
+
+std::optional<std::uint64_t> GStreamerRecorder::PipelineRunningTimeNs() const {
+#if !defined(CLIPDECK_HAS_GSTREAMER)
+  return std::nullopt;
+#else
+  if (pipeline_ == nullptr) {
+    return std::nullopt;
+  }
+  auto *pipeline = static_cast<GstElement *>(pipeline_);
+  GstClock *clock = gst_element_get_clock(pipeline);
+  if (clock == nullptr) {
+    return std::nullopt;
+  }
+  const GstClockTime now = gst_clock_get_time(clock);
+  const GstClockTime base = gst_element_get_base_time(pipeline);
+  gst_object_unref(clock);
+  if (!GST_CLOCK_TIME_IS_VALID(now) || !GST_CLOCK_TIME_IS_VALID(base) ||
+      now < base) {
+    return std::nullopt;
+  }
+  return now - base;
+#endif
+}
+
+void GStreamerRecorder::RecordFragmentMessage(void *raw_message) {
+#if defined(CLIPDECK_HAS_GSTREAMER)
+  auto *message = static_cast<GstMessage *>(raw_message);
+  const GstStructure *structure = gst_message_get_structure(message);
+  if (structure == nullptr) {
+    return;
+  }
+  const char *name = gst_structure_get_name(structure);
+  if (name == nullptr ||
+      (std::string_view(name) != "splitmuxsink-fragment-opened" &&
+       std::string_view(name) != "splitmuxsink-fragment-closed")) {
+    return;
+  }
+
+  const char *location = gst_structure_get_string(structure, "location");
+  guint64 running_time = GST_CLOCK_TIME_NONE;
+  if (location == nullptr ||
+      !gst_structure_get_uint64(structure, "running-time", &running_time) ||
+      !GST_CLOCK_TIME_IS_VALID(running_time)) {
+    return;
+  }
+
+  const std::filesystem::path path(location);
+  std::scoped_lock lock(fragment_mutex_);
+  if (std::string_view(name) == "splitmuxsink-fragment-opened") {
+    open_fragments_[path] = running_time;
+    return;
+  }
+
+  std::uint64_t start = 0;
+  if (const auto opened = open_fragments_.find(path);
+      opened != open_fragments_.end()) {
+    start = opened->second;
+    open_fragments_.erase(opened);
+  } else if (!fragments_.empty()) {
+    start = fragments_.back().end_running_time_ns;
+  }
+  fragments_.push_back(FragmentBoundary{.path = path,
+                                        .start_running_time_ns = start,
+                                        .end_running_time_ns = running_time});
+  PruneFragmentsLocked(running_time);
+  fragment_condition_.notify_all();
+#else
+  (void)raw_message;
+#endif
+}
+
+void GStreamerRecorder::PruneFragmentsLocked(
+    std::uint64_t latest_running_time_ns) {
+  constexpr std::uint64_t kNanosecondsPerSecond = 1000000000ULL;
+  const auto live_window =
+      static_cast<std::uint64_t>(std::max(
+          config_.clip_length_seconds + config_.buffer_safety_seconds + 3, 1)) *
+      kNanosecondsPerSecond;
+  std::uint64_t keep_after = latest_running_time_ns > live_window
+                                 ? latest_running_time_ns - live_window
+                                 : 0;
+  const auto target =
+      static_cast<std::uint64_t>(std::max(config_.clip_length_seconds, 1)) *
+      kNanosecondsPerSecond;
+  for (const auto &[request_id, cutoff] : request_cutoffs_) {
+    (void)request_id;
+    const auto request_start = cutoff > target ? cutoff - target : 0;
+    keep_after = std::min(keep_after, request_start);
+  }
+
+  auto first_kept = fragments_.begin();
+  while (first_kept != fragments_.end() &&
+         first_kept->end_running_time_ns < keep_after) {
+    std::error_code error;
+    std::filesystem::remove(first_kept->path, error);
+    ++first_kept;
+  }
+  fragments_.erase(fragments_.begin(), first_kept);
 }
 
 bool GStreamerRecorder::WaitForAnyFinalizedSegment(
@@ -1099,13 +1304,14 @@ bool GStreamerRecorder::WaitForAnyFinalizedSegment(
   return !SelectSegmentsForClip().empty();
 }
 
-std::vector<std::filesystem::path> GStreamerRecorder::SelectSegmentsForClip() const {
+std::vector<std::filesystem::path>
+GStreamerRecorder::SelectSegmentsForClip() const {
   const auto selected_count = static_cast<std::size_t>(
       std::max(config_.clip_length_seconds +
                    std::clamp(config_.buffer_safety_seconds, 1, 3),
                1));
   return SelectRecentFinalizedSegmentsByCount(segment_directory_,
-                                             selected_count);
+                                              selected_count);
 }
 
 std::size_t GStreamerRecorder::SegmentBytes() const {
@@ -1139,7 +1345,8 @@ std::size_t GStreamerRecorder::SegmentCount() const {
 
   for (const auto &entry :
        std::filesystem::directory_iterator(segment_directory_, error)) {
-    if (error || !entry.is_regular_file() || entry.path().extension() != ".mp4") {
+    if (error || !entry.is_regular_file() ||
+        entry.path().extension() != ".mp4") {
       continue;
     }
 
@@ -1172,16 +1379,21 @@ std::string GStreamerRecorder::BuildPipelineDescription() const {
                   config_.width, config_.height, config_.fps);
 
   const std::string video_encoder =
-      config_.encoder == "x264"
-          ? std::format("x264enc tune=zerolatency speed-preset=veryfast bitrate={} "
+      (config_.encoder == "x264" ||
+#if defined(CLIPDECK_HAS_GSTREAMER)
+       (config_.encoder == "auto" && GstElementAvailable("x264enc")))
+#else
+       config_.encoder == "auto")
+#endif
+          ? std::format("x264enc speed-preset=veryfast bitrate={} "
                         "key-int-max={} ! h264parse config-interval=-1 "
                         "! video/x-h264,stream-format=avc,alignment=au",
-                        config_.video_bitrate_kbps, config_.fps)
+                        EffectiveVideoBitrateKbps(config_), config_.fps)
           : std::format("openh264enc bitrate={} rate-control=bitrate "
                         "usage-type=screen gop-size={} ! h264parse "
                         "config-interval=-1 ! "
                         "video/x-h264,stream-format=avc,alignment=au",
-                        config_.video_bitrate_kbps * 1000, config_.fps);
+                        EffectiveVideoBitrateKbps(config_) * 1000, config_.fps);
 
   const auto segment_pattern =
       (segment_directory_ / "clipdeck-%05d.mp4").string();
@@ -1192,13 +1404,11 @@ std::string GStreamerRecorder::BuildPipelineDescription() const {
   pipeline << "splitmuxsink name=clipdeck_splitmux "
            << "location=" << GstQuote(segment_pattern) << " "
            << "max-size-time=" << max_size_time << " "
-           << "max-files=" << RetainedSegmentCount(config_) << " "
-           << "async-finalize=true muxer-factory=mp4mux "
-           << video_source
-           << " ! " << LiveRawVideoQueue(config_) << " ! "
-           << video_convert << " "
-           << "! " << LiveRawVideoQueue(config_) << " ! "
-           << video_encoder
+           << "max-files=0 send-keyframe-requests=true "
+           << "async-finalize=true muxer-factory=mp4mux " << video_source
+           << " ! " << LiveRawVideoQueue(config_) << " ! " << video_convert
+           << " "
+           << "! " << LiveRawVideoQueue(config_) << " ! " << video_encoder
            << " ! " << LiveEncodedVideoQueue(config_)
            << " ! clipdeck_splitmux.video ";
 
@@ -1213,20 +1423,17 @@ std::string GStreamerRecorder::BuildPipelineDescription() const {
         use_fdk_aac ? "audio/x-raw,format=S16LE,rate=48000,channels=2"
                     : "audio/x-raw,format=F32LE,rate=48000,channels=2";
     const std::string audio_encoder =
-        use_fdk_aac
-            ? std::format("fdkaacenc bitrate={} ! aacparse",
-                          config_.audio_bitrate_kbps * 1000)
-            : std::format("avenc_aac bitrate={} ! aacparse",
-                          config_.audio_bitrate_kbps * 1000);
+        use_fdk_aac ? std::format("fdkaacenc bitrate={} ! aacparse",
+                                  config_.audio_bitrate_kbps * 1000)
+                    : std::format("avenc_aac bitrate={} ! aacparse",
+                                  config_.audio_bitrate_kbps * 1000);
 
     pipeline << "pulsesrc name=clipdeck_output_audio_source device="
-             << GstQuote(config_.audio_source)
-             << " do-timestamp=true "
+             << GstQuote(config_.audio_source) << " do-timestamp=true "
              << "! " << LiveRawAudioQueue() << " "
-             << "! audioconvert ! audioresample "
+             << "! audioconvert ! audioresample ! audiorate "
              << "! " << audio_caps << " "
-             << "! " << audio_encoder
-             << " ! " << LiveEncodedAudioQueue(config_)
+             << "! " << audio_encoder << " ! " << LiveEncodedAudioQueue(config_)
              << " ! clipdeck_splitmux.audio_0 ";
   }
 

@@ -58,6 +58,7 @@ SettingsStore::SettingsStore(std::filesystem::path settings_path)
 
 ClipDeckSettings SettingsStore::Load() const {
   ClipDeckSettings settings;
+  bool stored_version = false;
   settings.clip_directory = settings_path_.parent_path() / "clips";
   std::ifstream input(settings_path_);
 
@@ -68,6 +69,15 @@ ClipDeckSettings SettingsStore::Load() const {
   std::string line;
   while (std::getline(input, line)) {
     const auto [key, value] = SplitSettingLine(line);
+
+    if (key == "settings_version") {
+      int version = 0;
+      if (ParsePositiveInteger(value, version)) {
+        settings.settings_version = version;
+        stored_version = true;
+      }
+      continue;
+    }
 
     if (key == "clip_length_seconds") {
       int seconds = 0;
@@ -104,7 +114,8 @@ ClipDeckSettings SettingsStore::Load() const {
       if (value != "portal") {
         settings.capture_video_source = "portal";
         Log(LogLevel::Warning, kSettingsContext,
-            "Ignored legacy video source from settings; native capture uses the XDG portal picker.");
+            "Ignored legacy video source from settings; native capture uses "
+            "the XDG portal picker.");
       } else {
         settings.capture_video_source = value;
       }
@@ -165,6 +176,14 @@ ClipDeckSettings SettingsStore::Load() const {
       continue;
     }
 
+    if (key == "max_clip_size_mb") {
+      int size_mb = 0;
+      if (ParsePositiveInteger(value, size_mb)) {
+        settings.max_clip_size_mb = size_mb;
+      }
+      continue;
+    }
+
     if (key == "encoder" && !value.empty()) {
       settings.encoder = value;
       continue;
@@ -194,8 +213,15 @@ ClipDeckSettings SettingsStore::Load() const {
       }
       continue;
     }
-
   }
+
+  if (!stored_version && settings.video_bitrate_kbps == 12000 &&
+      settings.audio_bitrate_kbps == 192 && settings.encoder == "openh264") {
+    settings.video_bitrate_kbps = 2500;
+    settings.audio_bitrate_kbps = 128;
+    settings.encoder = "auto";
+  }
+  settings.settings_version = 2;
 
   return settings;
 }
@@ -205,9 +231,9 @@ bool SettingsStore::Save(const ClipDeckSettings &settings) const {
   std::filesystem::create_directories(settings_path_.parent_path(), error);
 
   if (error) {
-    HandleError(MakeError("settings_directory", kSettingsContext,
-                          "Failed to create settings directory: " +
-                              error.message()));
+    HandleError(
+        MakeError("settings_directory", kSettingsContext,
+                  "Failed to create settings directory: " + error.message()));
     return false;
   }
 
@@ -219,6 +245,7 @@ bool SettingsStore::Save(const ClipDeckSettings &settings) const {
     return false;
   }
 
+  output << "settings_version=" << settings.settings_version << '\n';
   output << "clip_length_seconds=" << settings.clip_length_seconds << '\n';
   output << "buffer_safety_seconds=" << settings.buffer_safety_seconds << '\n';
   output << "save_keybind=" << settings.save_keybind << '\n';
@@ -233,6 +260,7 @@ bool SettingsStore::Save(const ClipDeckSettings &settings) const {
   output << "capture_fps=" << settings.capture_fps << '\n';
   output << "video_bitrate_kbps=" << settings.video_bitrate_kbps << '\n';
   output << "audio_bitrate_kbps=" << settings.audio_bitrate_kbps << '\n';
+  output << "max_clip_size_mb=" << settings.max_clip_size_mb << '\n';
   output << "encoder=" << settings.encoder << '\n';
   output << "feedback_sound_enabled="
          << (settings.feedback_sound_enabled ? "true" : "false") << '\n';

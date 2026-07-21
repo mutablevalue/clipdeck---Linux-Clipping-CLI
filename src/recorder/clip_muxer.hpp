@@ -18,6 +18,8 @@ struct ClipMuxerOptions {
   bool audio_enabled = true;
   bool trust_recorder_segments = false;
   std::optional<double> available_duration_seconds;
+  double end_trim_seconds = 0.0;
+  std::optional<std::uintmax_t> max_output_bytes;
   bool validate_black_frames = true;
 };
 
@@ -27,8 +29,8 @@ public:
   ClipMuxer(std::filesystem::path clip_directory,
             std::filesystem::path temp_directory);
 
-  [[nodiscard]] std::optional<std::filesystem::path>
-  WriteClipFromSegments(const std::vector<std::filesystem::path> &segments) const;
+  [[nodiscard]] std::optional<std::filesystem::path> WriteClipFromSegments(
+      const std::vector<std::filesystem::path> &segments) const;
   [[nodiscard]] std::optional<std::filesystem::path>
   WriteClipFromSegments(const std::vector<std::filesystem::path> &segments,
                         const ClipMuxerOptions &options) const;

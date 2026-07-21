@@ -42,7 +42,8 @@ void PrintAudioDevices() {
 
   if (!found_monitor) {
     Log(LogLevel::Warning, kCommandContext,
-        "No output monitor sources were found from pactl. Make sure PipeWire/PulseAudio is running.");
+        "No output monitor sources were found from pactl. Make sure "
+        "PipeWire/PulseAudio is running.");
   }
 }
 
@@ -170,7 +171,8 @@ int CommandHandler::Run(int argc, char *argv[]) {
 
   if (command == "time") {
     Log(LogLevel::Error, kCommandContext,
-        "The time command moved to settings. Use: clipdeck settings length <seconds>.");
+        "The time command moved to settings. Use: clipdeck settings length "
+        "<seconds>.");
     return 1;
   }
 
@@ -217,8 +219,7 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
       return 0;
     }
 
-    Log(LogLevel::Error, kCommandContext,
-        "Usage: clipdeck settings keybind");
+    Log(LogLevel::Error, kCommandContext, "Usage: clipdeck settings keybind");
     return 1;
   }
 
@@ -301,7 +302,8 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
     const std::string_view source = argv[3];
     if (source != "portal") {
       Log(LogLevel::Error, kCommandContext,
-          "Native video capture uses the XDG portal picker. Use: clipdeck settings video-source portal");
+          "Native video capture uses the XDG portal picker. Use: clipdeck "
+          "settings video-source portal");
       return 1;
     }
 
@@ -427,17 +429,35 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
     return 0;
   }
 
+  if (setting == "max-size") {
+    if (argc != 4) {
+      Log(LogLevel::Error, kCommandContext,
+          "Usage: clipdeck settings max-size <mb>");
+      return 1;
+    }
+
+    int size_mb = 0;
+    if (!ParsePositiveInteger(argv[3], size_mb)) {
+      Log(LogLevel::Error, kCommandContext,
+          "Maximum clip size must be a positive whole number of MB.");
+      return 1;
+    }
+
+    clipdeck.SetMaxClipSize(size_mb);
+    return 0;
+  }
+
   if (setting == "encoder") {
     if (argc != 4) {
       Log(LogLevel::Error, kCommandContext,
-          "Usage: clipdeck settings encoder <openh264|x264>");
+          "Usage: clipdeck settings encoder <auto|openh264|x264>");
       return 1;
     }
 
     const std::string encoder = argv[3];
-    if (encoder != "openh264" && encoder != "x264") {
+    if (encoder != "auto" && encoder != "openh264" && encoder != "x264") {
       Log(LogLevel::Error, kCommandContext,
-          "Encoder must be openh264 or x264.");
+          "Encoder must be auto, openh264, or x264.");
       return 1;
     }
 
@@ -453,11 +473,14 @@ int CommandHandler::RunSettingsCommand(int argc, char *argv[]) const {
 int CommandHandler::SetKeybindFromCapture(std::string_view action) const {
   Log(LogLevel::Info, kCommandContext,
       "Press the " + std::string(action) +
-          " keybind for terminal-only setup capture, for example Ctrl + Z + P.");
+          " keybind for terminal-only setup capture, for example Ctrl + Z + "
+          "P.");
   Log(LogLevel::Info, kCommandContext,
-      "For terminal capture, hold Ctrl and press Z, then press P, then press Enter.");
+      "For terminal capture, hold Ctrl and press Z, then press P, then press "
+      "Enter.");
   Log(LogLevel::Info, kCommandContext,
-      "This setup capture does not verify global /dev/input event permissions for the daemon.");
+      "This setup capture does not verify global /dev/input event permissions "
+      "for the daemon.");
 
   const auto captured_keybind =
       CaptureKeybindFromTerminal(std::chrono::seconds(15));
@@ -494,11 +517,13 @@ void CommandHandler::PrintHelp() const {
   Log(LogLevel::Info, kCommandContext,
       "  save                          Request a clip save");
   Log(LogLevel::Info, kCommandContext,
-      "  choose-capture                Reopen the desktop portal capture picker");
+      "  choose-capture                Reopen the desktop portal capture "
+      "picker");
   Log(LogLevel::Info, kCommandContext,
       "  status                        Show runtime status and settings");
   Log(LogLevel::Info, kCommandContext,
-      "  setup                         Validate and save native capture sources");
+      "  setup                         Validate and save native capture "
+      "sources");
   Log(LogLevel::Info, kCommandContext,
       "  diagnose                      Check recorder configuration");
   Log(LogLevel::Info, kCommandContext,
@@ -520,7 +545,8 @@ void CommandHandler::PrintHelp() const {
   Log(LogLevel::Info, kCommandContext,
       "  settings video-source portal  Use the desktop portal picker");
   Log(LogLevel::Info, kCommandContext,
-      "  settings audio <on|off|auto>  Enable, disable, or auto-select output audio");
+      "  settings audio <on|off|auto>  Enable, disable, or auto-select output "
+      "audio");
   Log(LogLevel::Info, kCommandContext,
       "  settings audio devices        List output audio monitor sources");
   Log(LogLevel::Info, kCommandContext,
@@ -534,7 +560,9 @@ void CommandHandler::PrintHelp() const {
   Log(LogLevel::Info, kCommandContext,
       "  settings audio-bitrate <kbps> Set audio bitrate");
   Log(LogLevel::Info, kCommandContext,
-      "  settings encoder <enc>        Set encoder openh264 or x264");
+      "  settings max-size <mb>        Set maximum final clip size");
+  Log(LogLevel::Info, kCommandContext,
+      "  settings encoder <enc>        Set encoder auto, openh264, or x264");
   Log(LogLevel::Info, kCommandContext,
       "  help                          Show this help");
 }

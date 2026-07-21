@@ -9,6 +9,7 @@ namespace clipdeck {
 inline constexpr std::string_view kAutomaticAudioSource = "auto";
 
 struct ClipDeckSettings {
+  int settings_version = 2;
   int clip_length_seconds = 30;
   int buffer_safety_seconds = 5;
   std::string save_keybind = "Ctrl+Z+P";
@@ -20,9 +21,10 @@ struct ClipDeckSettings {
   int capture_width = 1920;
   int capture_height = 1080;
   int capture_fps = 60;
-  int video_bitrate_kbps = 12000;
-  int audio_bitrate_kbps = 192;
-  std::string encoder = "openh264";
+  int video_bitrate_kbps = 2500;
+  int audio_bitrate_kbps = 128;
+  int max_clip_size_mb = 11;
+  std::string encoder = "auto";
   bool feedback_sound_enabled = true;
   std::filesystem::path feedback_sound_path;
   double feedback_sound_volume = 0.5;
